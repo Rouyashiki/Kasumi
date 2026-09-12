@@ -930,30 +930,17 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 				      "proc op kprobe" : "none");
 		written += n;
 
-		/* mountinfo/mounts hide */
-		if (kasumi_proc_proxy_registered)
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "mountinfo/mounts: fd-install fop proxy\n");
-		else if (kasumi_mount_hide_vfsmnt_registered && kasumi_mount_hide_mountinfo_registered)
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "mountinfo/mounts: kprobe (show_mountinfo, show_vfsmnt)\n");
-		else if (kasumi_mount_hide_vfsmnt_registered)
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "mounts: kprobe (show_vfsmnt)\n");
-		else if (kasumi_mount_hide_mountinfo_registered)
-			n = scnprintf(kbuf + written, buf_size - written,
-				     "mountinfo: kprobe (show_mountinfo)\n");
-		else
-			n = scnprintf(kbuf + written, buf_size - written, "mountinfo/mounts: none\n");
-		written += n;
 		n = scnprintf(kbuf + written, buf_size - written,
-			      "fake mountinfo: %s (mode=%s)\n",
-			      kasumi_proc_proxy_registered &&
-			      kasumi_fake_mi_active() ?
-				      "root-owned mounts hidden, compact ids" : "none",
-			      READ_ONCE(kasumi_mount_hide_mode) ==
-				      KSM_MOUNT_HIDE_MODE_AGGRESSIVE ?
-				      "aggressive" : "normal");
+			      "mountinfo: %s\nmounts: native\n",
+			      kasumi_proc_proxy_registered
+				  ? "fd-install fop proxy (isolated readers)"
+				  : "none");
+		written += n;
+		n = scnprintf(
+		    kbuf + written, buf_size - written, "fake mountinfo: %s\n",
+		    kasumi_proc_proxy_registered && kasumi_fake_mi_active()
+			? "live deny app view, native ids and mount entries"
+			: "none");
 		written += n;
 		n = scnprintf(kbuf + written, buf_size - written,
 			      "mount namespace links: %s\n",
