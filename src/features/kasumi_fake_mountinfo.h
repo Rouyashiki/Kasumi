@@ -12,14 +12,27 @@
 
 #include <linux/fs.h>
 #include <linux/poll.h>
+#include <linux/refcount.h>
 
 struct mnt_namespace;
+
+struct kasumi_mi_snapshot {
+	refcount_t refs;
+	char *data;
+	size_t len;
+	char *mounts;
+	size_t mounts_len;
+};
 
 int kasumi_fake_mi_init(void);
 void kasumi_fake_mi_exit(void);
 bool kasumi_fake_mi_active(void);
-bool kasumi_fake_mi_redirect(struct file *file,
-			     struct mnt_namespace **original_ns);
+int kasumi_fake_mi_get_snapshot(struct file *file,
+				const struct file_operations *ops,
+				struct mnt_namespace **original_ns,
+				struct kasumi_mi_snapshot **out);
+void kasumi_fake_mi_put_snapshot(struct kasumi_mi_snapshot *snapshot);
+bool kasumi_fake_mi_cached(void);
 void kasumi_fake_mi_put_ns(struct mnt_namespace *ns);
 void kasumi_fake_mi_invalidate_all(void);
 u64 kasumi_fake_mi_generation(void);

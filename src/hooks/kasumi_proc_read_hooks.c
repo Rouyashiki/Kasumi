@@ -58,6 +58,7 @@ static int kasumi_filter_maps_lines(const char *src, size_t len,
 enum kasumi_proc_proxy_kind {
 	KASUMI_PROC_PROXY_NONE = 0,
 	KASUMI_PROC_PROXY_MOUNTINFO,
+	KASUMI_PROC_PROXY_MOUNTS,
 	KASUMI_PROC_PROXY_MAPS,
 };
 
@@ -104,10 +105,8 @@ struct kasumi_mount_file_proxy {
 	bool stream_failed;
 	struct mnt_namespace *original_mnt_ns;
 	bool mountinfo_checked;
-	bool mountinfo_changed;
-	wait_queue_head_t mountinfo_wait;
-	wait_queue_head_t *mountinfo_source_wait;
-	wait_queue_entry_t mountinfo_source_entry;
+	int mountinfo_error;
+	struct kasumi_mi_snapshot *mountinfo_snapshot;
 };
 
 static LIST_HEAD(kasumi_proxy_list);
@@ -278,8 +277,10 @@ kasumi_proc_proxy_kind_for_file(struct file *file,
 	name = &file->f_path.dentry->d_name;
 	if (spoof && kasumi_policy_current_is_isolated() &&
 	    (READ_ONCE(kasumi_feature_enabled_mask) & KSM_FEATURE_MOUNT_HIDE) &&
-	    name->len == 9 && !memcmp(name->name, "mountinfo", 9))
-		return KASUMI_PROC_PROXY_MOUNTINFO;
+	    ((name->len == 9 && !memcmp(name->name, "mountinfo", 9)) ||
+	     (name->len == 6 && !memcmp(name->name, "mounts", 6))))
+		return name->len == 9 ? KASUMI_PROC_PROXY_MOUNTINFO
+				      : KASUMI_PROC_PROXY_MOUNTS;
 	if ((spoof && (kasumi_feature_enabled_mask & KSM_FEATURE_MAPS_SPOOF)) &&
 	    ((name->len == 4 && !memcmp(name->name, "maps", 4)) ||
 	     (name->len == 5 && !memcmp(name->name, "smaps", 5)) ||
@@ -631,60 +632,42 @@ static ssize_t kasumi_mount_proxy_stream_fill(
 	}
 }
 
-static int kasumi_mount_proxy_source_wake(wait_queue_entry_t *entry,
-					  unsigned int mode, int sync,
-					  void *key)
-{
-	struct kasumi_mount_file_proxy *proxy = container_of(
-	    entry, struct kasumi_mount_file_proxy, mountinfo_source_entry);
-
-	wake_up_interruptible_poll(&proxy->mountinfo_wait, EPOLLERR | EPOLLPRI);
-	return 0;
-}
-
-static void kasumi_mount_proxy_source_queue(struct file *file,
-					    wait_queue_head_t *source,
-					    poll_table *wait)
-{
-	struct kasumi_mount_file_proxy *proxy = container_of(
-	    file->f_op, struct kasumi_mount_file_proxy, proxy_fops);
-
-	if (proxy->mountinfo_source_wait == source)
-		return;
-	if (proxy->mountinfo_source_wait)
-		remove_wait_queue(proxy->mountinfo_source_wait,
-				  &proxy->mountinfo_source_entry);
-	proxy->mountinfo_source_wait = source;
-	add_wait_queue(source, &proxy->mountinfo_source_entry);
-}
-
-static KASUMI_NOCFI __poll_t kasumi_mount_proxy_poll_source(
-    struct kasumi_mount_file_proxy *proxy, struct file *file)
-{
-	poll_table wait;
-
-	if (!proxy->orig_fops->poll)
-		return EPOLLIN | EPOLLRDNORM;
-	init_poll_funcptr(&wait, kasumi_mount_proxy_source_queue);
-	return proxy->orig_fops->poll(file, &wait);
-}
-
-static void
+static int
 kasumi_mount_proxy_prepare_mountinfo(struct kasumi_mount_file_proxy *proxy,
 				     struct file *file)
 {
-	if (proxy->mountinfo_checked)
-		return;
-	proxy->mountinfo_changed =
-	    kasumi_fake_mi_redirect(file, &proxy->original_mnt_ns);
-	proxy->mountinfo_checked = true;
-	if (proxy->mountinfo_changed) {
-		/* epoll only registers wait queues during ADD, so forward from
-		 * a stable queue while switching its native namespace source.
-		 */
-		(void)kasumi_mount_proxy_poll_source(proxy, file);
-		wake_up_all(&proxy->mountinfo_wait);
+	if (!proxy->mountinfo_snapshot &&
+	    (!proxy->mountinfo_checked || kasumi_fake_mi_cached())) {
+		proxy->mountinfo_error = kasumi_fake_mi_get_snapshot(
+		    file, proxy->orig_fops, &proxy->original_mnt_ns,
+		    &proxy->mountinfo_snapshot);
+		proxy->mountinfo_checked = true;
 	}
+	return proxy->mountinfo_error;
+}
+
+static ssize_t
+kasumi_mount_proxy_read_snapshot(const struct kasumi_mi_snapshot *snapshot,
+				 bool mounts, char __user *buffer,
+				 struct iov_iter *to, size_t count, loff_t *pos)
+{
+	const char *data = mounts ? snapshot->mounts : snapshot->data;
+	size_t len = mounts ? snapshot->mounts_len : snapshot->len;
+	size_t copied;
+
+	if (!pos || *pos < 0)
+		return -EINVAL;
+	if (*pos >= len || !count)
+		return 0;
+	count = min_t(size_t, count, len - (size_t)*pos);
+	if (to)
+		copied = copy_to_iter(data + *pos, count, to);
+	else
+		copied = count - copy_to_user(buffer, data + *pos, count);
+	if (!copied)
+		return -EFAULT;
+	*pos += copied;
+	return copied;
 }
 
 static ssize_t kasumi_mount_proxy_filtered_read(
@@ -755,14 +738,26 @@ static KASUMI_NOCFI ssize_t kasumi_mount_proxy_read(struct file *file,
 {
 	struct kasumi_mount_file_proxy *proxy = container_of(
 	    file->f_op, struct kasumi_mount_file_proxy, proxy_fops);
-	ssize_t ret;
+	ssize_t ret = 0;
 	int srcu_idx = srcu_read_lock(&kasumi_proxy_srcu);
 
-	if (proxy->kind == KASUMI_PROC_PROXY_MOUNTINFO) {
+	if (proxy->kind == KASUMI_PROC_PROXY_MOUNTINFO ||
+	    proxy->kind == KASUMI_PROC_PROXY_MOUNTS) {
 		mutex_lock(&proxy->stream_lock);
-		if (count)
-			kasumi_mount_proxy_prepare_mountinfo(proxy, file);
-		ret = proxy->orig_fops->read(file, buf, count, ppos);
+		if (count) {
+			ret = kasumi_mount_proxy_prepare_mountinfo(proxy, file);
+			if (!ret) {
+				if (proxy->mountinfo_snapshot)
+					ret = kasumi_mount_proxy_read_snapshot(
+					    proxy->mountinfo_snapshot,
+					    proxy->kind ==
+						KASUMI_PROC_PROXY_MOUNTS,
+					    buf, NULL, count, ppos);
+				else
+					ret = proxy->orig_fops->read(
+					    file, buf, count, ppos);
+			}
+		}
 		mutex_unlock(&proxy->stream_lock);
 	} else if (kasumi_mount_proxy_filter_active(proxy)) {
 		ret = kasumi_mount_proxy_filtered_read(
@@ -780,14 +775,27 @@ static ssize_t kasumi_mount_proxy_read_iter(struct kiocb *iocb,
 	struct file *file = iocb->ki_filp;
 	struct kasumi_mount_file_proxy *proxy = container_of(
 	    file->f_op, struct kasumi_mount_file_proxy, proxy_fops);
-	ssize_t ret;
+	ssize_t ret = 0;
 	int srcu_idx = srcu_read_lock(&kasumi_proxy_srcu);
 
-	if (proxy->kind == KASUMI_PROC_PROXY_MOUNTINFO) {
+	if (proxy->kind == KASUMI_PROC_PROXY_MOUNTINFO ||
+	    proxy->kind == KASUMI_PROC_PROXY_MOUNTS) {
 		mutex_lock(&proxy->stream_lock);
-		if (iov_iter_count(to))
-			kasumi_mount_proxy_prepare_mountinfo(proxy, file);
-		ret = kasumi_mount_proxy_orig_read_iter(proxy, iocb, to);
+		if (iov_iter_count(to)) {
+			ret = kasumi_mount_proxy_prepare_mountinfo(proxy, file);
+			if (!ret) {
+				if (proxy->mountinfo_snapshot)
+					ret = kasumi_mount_proxy_read_snapshot(
+					    proxy->mountinfo_snapshot,
+					    proxy->kind ==
+						KASUMI_PROC_PROXY_MOUNTS,
+					    NULL, to, iov_iter_count(to),
+					    &iocb->ki_pos);
+				else
+					ret = kasumi_mount_proxy_orig_read_iter(
+					    proxy, iocb, to);
+			}
+		}
 		mutex_unlock(&proxy->stream_lock);
 	} else if (kasumi_mount_proxy_filter_active(proxy)) {
 		ret = kasumi_mount_proxy_filtered_read(
@@ -805,12 +813,15 @@ static KASUMI_NOCFI ssize_t kasumi_mount_proxy_splice_read(
 {
 	struct kasumi_mount_file_proxy *proxy = container_of(
 	    file->f_op, struct kasumi_mount_file_proxy, proxy_fops);
+	int ret = 0;
 
 	mutex_lock(&proxy->stream_lock);
 	if (len)
-		kasumi_mount_proxy_prepare_mountinfo(proxy, file);
+		ret = kasumi_mount_proxy_prepare_mountinfo(proxy, file);
 	mutex_unlock(&proxy->stream_lock);
-	/* Generic splice helpers may re-enter our read_iter callback. */
+	if (ret)
+		return ret;
+	/* The native proc splice helper consumes our read_iter callback. */
 	return proxy->orig_fops->splice_read(file, ppos, pipe, len, flags);
 }
 
@@ -882,12 +893,27 @@ static KASUMI_NOCFI loff_t kasumi_mount_proxy_llseek(struct file *file,
 
 	if (proxy->kind == KASUMI_PROC_PROXY_MAPS)
 		return -ESPIPE;
+	if (whence != SEEK_SET && whence != SEEK_CUR && whence != SEEK_END)
+		return -EINVAL;
+	if (whence == SEEK_SET && offset < 0)
+		return -EINVAL;
 	mutex_lock(&proxy->stream_lock);
-	if (offset && (whence == SEEK_SET || whence == SEEK_CUR))
-		kasumi_mount_proxy_prepare_mountinfo(proxy, file);
-	ret = proxy->orig_fops->llseek
-		  ? proxy->orig_fops->llseek(file, offset, whence)
-		  : -ESPIPE;
+	if (offset || whence == SEEK_END) {
+		ret = kasumi_mount_proxy_prepare_mountinfo(proxy, file);
+		if (ret)
+			goto unlock;
+	}
+	if (proxy->mountinfo_snapshot)
+		ret = generic_file_llseek_size(
+		    file, offset, whence, MAX_LFS_FILESIZE,
+		    (proxy->kind == KASUMI_PROC_PROXY_MOUNTS
+			 ? proxy->mountinfo_snapshot->mounts_len
+			 : proxy->mountinfo_snapshot->len));
+	else
+		ret = proxy->orig_fops->llseek
+			  ? proxy->orig_fops->llseek(file, offset, whence)
+			  : -ESPIPE;
+unlock:
 	mutex_unlock(&proxy->stream_lock);
 	return ret;
 }
@@ -897,17 +923,20 @@ kasumi_mount_proxy_poll(struct file *file, struct poll_table_struct *wait)
 {
 	struct kasumi_mount_file_proxy *proxy = container_of(
 	    file->f_op, struct kasumi_mount_file_proxy, proxy_fops);
-	__poll_t mask;
+	__poll_t mask = EPOLLIN | EPOLLRDNORM;
 	u64 generation;
+	bool cached;
 
 	mutex_lock(&proxy->stream_lock);
-	poll_wait(file, &proxy->mountinfo_wait, wait);
 	kasumi_fake_mi_poll_wait(file, wait);
-	mask = kasumi_mount_proxy_poll_source(proxy, file);
+	cached = proxy->mountinfo_snapshot || kasumi_fake_mi_cached();
+	if (proxy->mountinfo_error && !cached) {
+		mask = EPOLLERR;
+	} else if (!cached && proxy->orig_fops->poll) {
+		mask = proxy->orig_fops->poll(file, wait);
+	}
 	generation = kasumi_fake_mi_generation();
-	if (proxy->mountinfo_changed ||
-	    proxy->stream_generation != generation) {
-		proxy->mountinfo_changed = false;
+	if (proxy->stream_generation != generation) {
 		proxy->stream_generation = generation;
 		mask |= EPOLLERR | EPOLLPRI;
 	}
@@ -931,13 +960,12 @@ static KASUMI_NOCFI int kasumi_mount_proxy_release(struct inode *inode, struct f
 	atomic_dec(&kasumi_proxy_live);
 
 	WRITE_ONCE(file->f_mode, proxy->orig_f_mode);
-	if (proxy->mountinfo_source_wait)
-		remove_wait_queue(proxy->mountinfo_source_wait,
-				  &proxy->mountinfo_source_entry);
 	if (orig_fops->release)
 		ret = orig_fops->release(inode, file);
-	/* Poll sources are detached before either namespace is released. */
+	/* A poll before the initial snapshot may still reference this
+	 * namespace. */
 	kasumi_fake_mi_put_ns(proxy->original_mnt_ns);
+	kasumi_fake_mi_put_snapshot(proxy->mountinfo_snapshot);
 
 	/* Keep the live proxy's THIS_MODULE reference for __fput(), but stop
 	 * __fput() from touching proxy storage after this callback returns.
@@ -960,7 +988,8 @@ static int kasumi_mount_proxy_install_file(
 	if (!file || kind == KASUMI_PROC_PROXY_NONE ||
 	    atomic_read(&kasumi_proxy_shutdown))
 		return -ESHUTDOWN;
-	if (kind == KASUMI_PROC_PROXY_MOUNTINFO &&
+	if ((kind == KASUMI_PROC_PROXY_MOUNTINFO ||
+	     kind == KASUMI_PROC_PROXY_MOUNTS) &&
 	    scope != KASUMI_POLICY_SCOPE_SPOOF)
 		return -EINVAL;
 	if (kind == KASUMI_PROC_PROXY_MAPS &&
@@ -987,12 +1016,14 @@ static int kasumi_mount_proxy_install_file(
 	if (proxy->orig_fops->read)
 		proxy->proxy_fops.read = kasumi_mount_proxy_read;
 	proxy->proxy_fops.read_iter = kasumi_mount_proxy_read_iter;
-	proxy->proxy_fops.splice_read =
-	    kind == KASUMI_PROC_PROXY_MOUNTINFO && orig_fops->splice_read
-		? kasumi_mount_proxy_splice_read
-		: NULL;
+	proxy->proxy_fops.splice_read = (kind == KASUMI_PROC_PROXY_MOUNTINFO ||
+					 kind == KASUMI_PROC_PROXY_MOUNTS) &&
+						orig_fops->splice_read
+					    ? kasumi_mount_proxy_splice_read
+					    : NULL;
 	proxy->proxy_fops.llseek = kasumi_mount_proxy_llseek;
-	if (kind == KASUMI_PROC_PROXY_MOUNTINFO)
+	if (kind == KASUMI_PROC_PROXY_MOUNTINFO ||
+	    kind == KASUMI_PROC_PROXY_MOUNTS)
 		proxy->proxy_fops.poll = kasumi_mount_proxy_poll;
 	if (kind == KASUMI_PROC_PROXY_MAPS) {
 		proxy->proxy_fops.unlocked_ioctl = kasumi_mount_proxy_ioctl;
@@ -1005,9 +1036,6 @@ static int kasumi_mount_proxy_install_file(
 	atomic_set(&proxy->state, KASUMI_PROXY_STATE_OPEN);
 	atomic_set(&proxy->filter_invalidated, 0);
 	mutex_init(&proxy->stream_lock);
-	init_waitqueue_head(&proxy->mountinfo_wait);
-	init_waitqueue_func_entry(&proxy->mountinfo_source_entry,
-				  kasumi_mount_proxy_source_wake);
 	proxy->stream_orig_pos = 0;
 	proxy->stream_user_pos = 0;
 	proxy->stream_generation = kasumi_fake_mi_generation();

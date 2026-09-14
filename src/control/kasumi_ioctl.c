@@ -931,7 +931,7 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		written += n;
 
 		n = scnprintf(kbuf + written, buf_size - written,
-			      "mountinfo: %s\nmounts: native\n",
+			      "mountinfo/mounts: %s\n",
 			      kasumi_proc_proxy_registered
 				  ? "fd-install fop proxy (isolated readers)"
 				  : "none");
@@ -939,7 +939,7 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		n = scnprintf(
 		    kbuf + written, buf_size - written, "fake mountinfo: %s\n",
 		    kasumi_proc_proxy_registered && kasumi_fake_mi_active()
-			? "live deny app view, native ids and mount entries"
+			? "shared mount pair, normalized propagation IDs"
 			: "none");
 		written += n;
 		n = scnprintf(kbuf + written, buf_size - written,

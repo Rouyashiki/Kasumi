@@ -194,11 +194,12 @@ struct kasumi_spoof_kstat {
 #define KSM_FEATURE_SELINUX_BYPASS (1 << 4)
 #define KSM_FEATURE_MERGE_DIR      (1 << 5)
 #define KSM_FEATURE_MOUNT_HIDE                                                 \
-	(1 << 6) /* use a live deny app mountinfo view for isolated readers */
+	(1 << 6) /* use shared proc mount snapshots for isolated readers */
 #define KSM_FEATURE_MAPS_SPOOF    (1 << 7)  /* spoof ino/dev/pathname in /proc/pid/maps (read buffer filter) */
 #define KSM_FEATURE_STATFS_SPOOF  (1 << 8)  /* spoof statfs f_type so direct matches resolved (INCONSISTENT_MOUNT) */
 #define KSM_FEATURE_FAKE_MOUNTINFO                                             \
-	(1 << 9) /* live deny app mountinfo donor support */
+	(1 << 9) /* shared donor mount views with normalized propagation IDs   \
+		  */
 #define KSM_FEATURE_SELINUX_FIX (1 << 10) /* hide SELinux oracles from hidden app-zygote and isolated apps */
 #define KSM_FEATURE_FAKE_SELINUXFS KSM_FEATURE_SELINUX_FIX /* compatibility alias */
 #define KSM_FEATURE_QUIESCE     (1 << 11) /* terminal pre-unload quiesce handshake */
