@@ -1324,7 +1324,6 @@ add_rule_done:
 
 	case KSM_IOC_HIDE_RULE: {
 		char *resolved_src = NULL;
-		char *parent_dir = NULL;
 		struct path path;
 		struct inode *target_inode = NULL;
 		struct inode *parent_inode = NULL;
@@ -1355,24 +1354,6 @@ add_rule_done:
 			kfree(src);
 			src = resolved_src;
 		}
-		{
-			char *ls = strrchr(src, '/');
-
-			if (ls) {
-				if (ls == src)
-					parent_dir = kstrdup("/", GFP_KERNEL);
-				else {
-					size_t l = ls - src;
-
-					parent_dir = kmalloc(l + 1, GFP_KERNEL);
-					if (parent_dir) {
-						memcpy(parent_dir, src, l);
-						parent_dir[l] = '\0';
-					}
-				}
-			}
-		}
-
 		if (target_inode) {
 			kasumi_mark_inode_hidden(target_inode);
 			iput(target_inode);
@@ -1416,17 +1397,9 @@ add_rule_done:
 			}
 		}
 		mutex_unlock(&kasumi_config_mutex);
-		if (parent_dir) {
-			kasumi_mark_dir_has_inject(parent_dir);
-			kasumi_add_inject_rule(parent_dir);
-		}
-
-		/* Tier 3: when the lookup hijack is enabled, register this hidden
-		 * path so VFS lookup returns a negative dentry and readdir omits it
-		 * for view observers — sinking the hide off the TSR path routes.
-		 * Called regardless of the "already present" fast path so a hide
-		 * issued before dirhijack was enabled re-syncs its child; add_child
-		 * is idempotent. */
+		/* Rebind duplicate rules as well, in case lookup was unavailable
+		 * when the rule was first added. Hides emit no injected entries.
+		 */
 		if (kasumi_dirhijack_enabled())
 			(void)kasumi_dirhijack_hide(src);
 		break;
@@ -1470,7 +1443,6 @@ add_rule_done:
 
 	case KSM_IOC_DEL_RULE: {
 		struct inode *del_inode = NULL;
-		struct inode *del_parent_inode = NULL;
 
 		if (!src) { ret = -EINVAL; break; }
 
@@ -1492,11 +1464,6 @@ add_rule_done:
 				if (d_inode(dpath.dentry)) {
 					del_inode = d_inode(dpath.dentry);
 					kasumi_ihold(del_inode);
-				}
-				if (dpath.dentry->d_parent &&
-				    d_inode(dpath.dentry->d_parent)) {
-					del_parent_inode = d_inode(dpath.dentry->d_parent);
-					kasumi_ihold(del_parent_inode);
 				}
 				kfree(rbuf);
 				kasumi_path_put(&dpath);
@@ -1549,9 +1516,9 @@ del_done:
 				clear_bit(AS_FLAGS_KASUMI_HIDE,
 					  &del_inode->i_mapping->flags);
 			iput(del_inode);
-		}
-		if (del_parent_inode) {
-			iput(del_parent_inode);
+		} else {
+			/* A cached hidden negative may have blocked the first lookup. */
+			kasumi_clear_inode_flags_for_path(src, AS_FLAGS_KASUMI_HIDE);
 		}
 		break;
 	}

@@ -74,9 +74,9 @@ int kasumi_dirhijack_del(const char *visible_path);
 
 /*
  * Register a suppress-only ("hide") child at @visible_path: VFS lookup returns a
- * negative dentry and readdir omits the name for view-target observers, so the
- * real entry disappears for the view without a per-syscall TSR route.  Non-target
- * observers keep resolving the real entry.  Sleepable context only.
+ * negative dentry and readdir omits the name for hide-target observers.
+ * Privileged and rule-management lookups retain the real entry.
+ * Sleepable context only.
  */
 int kasumi_dirhijack_hide(const char *visible_path);
 

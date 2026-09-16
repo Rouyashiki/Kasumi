@@ -224,9 +224,15 @@ static bool kasumi_dh_current_sees(void)
 		return false;
 	if (READ_ONCE(kasumi_dirhijack_force))
 		return true;
-	/* Sole path-view engine, so this is the only serve gate: an unregistered
-	 * rule simply has no child here and falls through to the real entry. */
 	return kasumi_policy_current_is_view_target();
+}
+
+static bool kasumi_dh_current_targets(const struct kasumi_dh_child *child)
+{
+	if (child->hide)
+		return kasumi_dirhijack_enabled() &&
+		       kasumi_policy_current_is_hide_target();
+	return kasumi_dh_current_sees();
 }
 
 /* ---- hijacked lookup (SRCU-wrapped) ------------------------------------ */
@@ -246,7 +252,7 @@ static struct dentry *KASUMI_NOCFI kasumi_dh_lookup_inner(struct inode *dir,
 	bool found = false;
 	bool is_hide = false;
 
-	if (!m || !dn || !kasumi_dh_current_sees())
+	if (!m || !dn)
 		goto orig;
 
 	rcu_read_lock();
@@ -254,7 +260,7 @@ static struct dentry *KASUMI_NOCFI kasumi_dh_lookup_inner(struct inode *dir,
 				 (u16)dentry->d_name.len,
 				 full_name_hash(dir, dentry->d_name.name,
 						dentry->d_name.len));
-	if (c) {
+	if (c && kasumi_dh_current_targets(c)) {
 		if (c->source.dentry) {
 			source = c->source;
 			kasumi_path_get(&source);
@@ -403,7 +409,7 @@ static KASUMI_DH_ACTOR_RET KASUMI_NOCFI kasumi_dh_proxy_actor(
 		 * (inject / hide).  A lookup_only child leaves readdir to the
 		 * overlay filldir, which already emits and dedups the name, so it
 		 * must pass through here untouched. */
-		injected = c && !c->lookup_only;
+		injected = c && !c->lookup_only && kasumi_dh_current_targets(c);
 		rcu_read_unlock();
 	}
 	if (injected) {
@@ -424,6 +430,8 @@ static void kasumi_dh_emit_children(struct dir_context *ctx,
 	u32 want = kasumi_dh_unpack_pos(ctx->pos);
 	u32 idx = 0;
 
+	if (!kasumi_dh_current_sees())
+		return;
 	if (!kasumi_dh_virtual_pos(ctx->pos))
 		ctx->pos = kasumi_dh_pack_pos(0);
 	rcu_read_lock();
@@ -457,7 +465,8 @@ kasumi_dh_iterate_inner(struct file *file, struct dir_context *ctx,
 
 	if (!orig || !orig->iterate_shared)
 		return -ENOTDIR;
-	if (!dn || !kasumi_dh_current_sees())
+	if (!dn || (!kasumi_dh_current_sees() &&
+		    !kasumi_policy_current_is_hide_target()))
 		return orig->iterate_shared(file, ctx);
 
 	if (kasumi_dh_virtual_pos(ctx->pos)) {
@@ -471,6 +480,8 @@ kasumi_dh_iterate_inner(struct file *file, struct dir_context *ctx,
 	ret = orig->iterate_shared(file, &proxy.ctx);
 	ctx->pos = proxy.ctx.pos;
 	if (ret < 0)
+		return ret;
+	if (!kasumi_dh_current_sees())
 		return ret;
 
 	ctx->pos = kasumi_dh_pack_pos(0);
@@ -556,7 +567,7 @@ kasumi_dh_revalidate_inner(struct kasumi_dh_dop_meta *dm,
 	synthetic_negative = !inode && READ_ONCE(dm->synthetic_negative);
 	if (!dn || READ_ONCE(dn->retiring))
 		return 0;
-	sees = dn && kasumi_dh_current_sees();
+	sees = false;
 
 	/* A rename can leave the held dentry carrying our shadow outside the
 	 * directory where it was installed.  It is no longer governed there. */
@@ -570,6 +581,7 @@ kasumi_dh_revalidate_inner(struct kasumi_dh_dop_meta *dm,
 		if (c) {
 			governed = true;
 			child_hide = c->hide;
+			sees = kasumi_dh_current_targets(c);
 		}
 		rcu_read_unlock();
 	}
@@ -1429,9 +1441,9 @@ int kasumi_dirhijack_add_shadow(const char *visible_path,
 
 /*
  * Register a suppress-only child at @visible_path: VFS lookup returns a negative
- * dentry (-ENOENT) and readdir omits the name for view-target observers, while
- * non-target observers keep resolving the real entry.  Sinks a hide rule off
- * the TSR path routes.  Sleepable context only.  Returns 0 or a negative errno.
+ * dentry (-ENOENT) and readdir omits the name for hide-target observers.
+ * Privileged and rule-management lookups retain the real entry.
+ * Sleepable context only. Returns 0 or a negative errno.
  */
 int kasumi_dirhijack_hide(const char *visible_path)
 {

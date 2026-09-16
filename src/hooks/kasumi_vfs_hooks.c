@@ -141,7 +141,7 @@ kasumi_filldir_filter(struct dir_context *ctx, const char *name,
 		}
 	}
 
-	if (w->view_allowed && kasumi_d_hash_and_lookup && w->dir_has_hidden &&
+	if (kasumi_d_hash_and_lookup && w->dir_has_hidden &&
 	    w->parent_dentry) {
 		struct dentry *child;
 
@@ -808,6 +808,7 @@ KASUMI_NOCFI struct kasumi_filldir_wrapper *kasumi_iterate_prepare_wrapper(struc
 	struct inode *dir_inode;
 	const char *dname;
 	enum kasumi_policy_scope scope;
+	bool hide_allowed;
 
 	if (atomic_long_read(&kasumi_ioctl_tgid) == (long)task_tgid_vnr(current))
 		return NULL;
@@ -822,7 +823,8 @@ KASUMI_NOCFI struct kasumi_filldir_wrapper *kasumi_iterate_prepare_wrapper(struc
 	if (orig_ctx->actor == kasumi_filldir_filter)
 		return NULL;
 	scope = kasumi_policy_current_scope();
-	if (scope == KASUMI_POLICY_SCOPE_NONE)
+	hide_allowed = kasumi_policy_current_is_hide_target();
+	if (scope == KASUMI_POLICY_SCOPE_NONE && !hide_allowed)
 		return NULL;
 
 	w = kmem_cache_zalloc(kasumi_filldir_cache, GFP_ATOMIC);
@@ -840,7 +842,7 @@ KASUMI_NOCFI struct kasumi_filldir_wrapper *kasumi_iterate_prepare_wrapper(struc
 	if (w->parent_dentry) {
 		dir_inode = d_inode(w->parent_dentry);
 		if (dir_inode && dir_inode->i_mapping) {
-			w->dir_has_hidden = w->view_allowed &&
+			w->dir_has_hidden = hide_allowed &&
 				test_bit(AS_FLAGS_KASUMI_DIR_HAS_HIDDEN,
 						     &dir_inode->i_mapping->flags);
 			/* Fast path: if dir has no inject flag, skip rcu_read_lock + hash traversal */

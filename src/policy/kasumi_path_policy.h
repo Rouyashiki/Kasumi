@@ -65,6 +65,7 @@ int kasumi_policy_reset(void);
 void kasumi_policy_shutdown_locked(void);
 enum kasumi_policy_scope kasumi_policy_current_scope(void);
 bool kasumi_policy_current_is_view_target(void);
+bool kasumi_policy_current_is_hide_target(void);
 bool kasumi_policy_current_is_spoof_target(void);
 bool kasumi_policy_current_is_isolated(void);
 bool kasumi_current_is_selinux_guard_target(void);
