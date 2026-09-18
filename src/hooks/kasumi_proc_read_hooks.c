@@ -105,6 +105,7 @@ struct kasumi_mount_file_proxy {
 	bool stream_failed;
 	struct mnt_namespace *original_mnt_ns;
 	bool mountinfo_checked;
+	bool mountinfo_native;
 	int mountinfo_error;
 	struct kasumi_mi_snapshot *mountinfo_snapshot;
 };
@@ -178,12 +179,13 @@ static int kasumi_vfs_readlink_entry(struct kretprobe_instance *ri,
 	d->candidate = false;
 
 	if (READ_ONCE(kasumi_mount_hide_mode) !=
-		    KSM_MOUNT_HIDE_MODE_AGGRESSIVE ||
+		KSM_MOUNT_HIDE_MODE_AGGRESSIVE ||
 	    !(READ_ONCE(kasumi_feature_enabled_mask) &
 	      KSM_FEATURE_MOUNT_HIDE) ||
 	    !kasumi_fake_mi_active() ||
 	    !kasumi_policy_current_is_spoof_target() ||
-	    !kasumi_current_inherits_root_parent_mnt_ns())
+	    !kasumi_current_inherits_root_parent_mnt_ns() ||
+	    kasumi_fake_mi_native_view(NULL))
 		return 0;
 
 #if defined(__aarch64__)
@@ -637,10 +639,11 @@ kasumi_mount_proxy_prepare_mountinfo(struct kasumi_mount_file_proxy *proxy,
 				     struct file *file)
 {
 	if (!proxy->mountinfo_snapshot &&
-	    (!proxy->mountinfo_checked || kasumi_fake_mi_cached())) {
+	    (!proxy->mountinfo_checked ||
+	     (!proxy->mountinfo_native && kasumi_fake_mi_cached()))) {
 		proxy->mountinfo_error = kasumi_fake_mi_get_snapshot(
-		    file, proxy->orig_fops, &proxy->original_mnt_ns,
-		    &proxy->mountinfo_snapshot);
+		    file, proxy->orig_fops, proxy->mountinfo_native,
+		    &proxy->original_mnt_ns, &proxy->mountinfo_snapshot);
 		proxy->mountinfo_checked = true;
 	}
 	return proxy->mountinfo_error;
@@ -898,6 +901,16 @@ static KASUMI_NOCFI loff_t kasumi_mount_proxy_llseek(struct file *file,
 	if (whence == SEEK_SET && offset < 0)
 		return -EINVAL;
 	mutex_lock(&proxy->stream_lock);
+	if (proxy->mountinfo_native && !offset && whence == SEEK_SET) {
+		ret = proxy->orig_fops->llseek(file, 0, SEEK_SET);
+		if (!ret) {
+			kasumi_fake_mi_put_snapshot(proxy->mountinfo_snapshot);
+			proxy->mountinfo_snapshot = NULL;
+			proxy->mountinfo_checked = false;
+			proxy->mountinfo_error = 0;
+		}
+		goto unlock;
+	}
 	if (offset || whence == SEEK_END) {
 		ret = kasumi_mount_proxy_prepare_mountinfo(proxy, file);
 		if (ret)
@@ -928,6 +941,14 @@ kasumi_mount_proxy_poll(struct file *file, struct poll_table_struct *wait)
 	bool cached;
 
 	mutex_lock(&proxy->stream_lock);
+	if (proxy->mountinfo_native) {
+		if (proxy->orig_fops->poll)
+			mask = proxy->orig_fops->poll(file, wait);
+		if (proxy->mountinfo_error)
+			mask |= EPOLLERR;
+		mutex_unlock(&proxy->stream_lock);
+		return mask;
+	}
 	kasumi_fake_mi_poll_wait(file, wait);
 	cached = proxy->mountinfo_snapshot || kasumi_fake_mi_cached();
 	if (proxy->mountinfo_error && !cached) {
@@ -1005,6 +1026,9 @@ static int kasumi_mount_proxy_install_file(
 
 	proxy->orig_fops = orig_fops;
 	proxy->kind = kind;
+	if (kind == KASUMI_PROC_PROXY_MOUNTINFO ||
+	    kind == KASUMI_PROC_PROXY_MOUNTS)
+		proxy->mountinfo_native = kasumi_fake_mi_native_view(file);
 	proxy->scope = scope;
 	proxy->orig_f_mode = READ_ONCE(file->f_mode);
 	proxy->proxy_fops = *orig_fops;

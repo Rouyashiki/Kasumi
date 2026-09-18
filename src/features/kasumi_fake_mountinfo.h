@@ -27,8 +27,10 @@ struct kasumi_mi_snapshot {
 int kasumi_fake_mi_init(void);
 void kasumi_fake_mi_exit(void);
 bool kasumi_fake_mi_active(void);
+bool kasumi_fake_mi_native_view(struct file *file);
 int kasumi_fake_mi_get_snapshot(struct file *file,
 				const struct file_operations *ops,
+				bool native_view,
 				struct mnt_namespace **original_ns,
 				struct kasumi_mi_snapshot **out);
 void kasumi_fake_mi_put_snapshot(struct kasumi_mi_snapshot *snapshot);
