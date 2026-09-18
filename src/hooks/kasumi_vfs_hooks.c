@@ -46,6 +46,7 @@
 #endif
 #include <asm/unistd.h>
 #include "kasumi_runtime.h"
+#include "kasumi_dirhijack.h"
 #include "kasumi_store.h"
 #include "kasumi_entrypoints.h"
 #include "kasumi_path_policy.h"
@@ -73,6 +74,8 @@ kasumi_filldir_filter(struct dir_context *ctx, const char *name,
 	struct kasumi_filldir_wrapper *w =
 		container_of(ctx, struct kasumi_filldir_wrapper, wrap_ctx);
 	KASUMI_FILLDIR_RET_TYPE ret;
+	struct inode *parent =
+	    w->parent_dentry ? d_inode(w->parent_dentry) : NULL;
 
 	/* Inject phase: before first real entry, emit entries from merge targets
 	 * and kasumi_paths into the directory listing. */
@@ -88,6 +91,13 @@ kasumi_filldir_filter(struct dir_context *ctx, const char *name,
 
 		list_for_each_entry_safe(item, tmp, &head, list) {
 			int nlen = strlen(item->name);
+			if (parent &&
+			    kasumi_dirhijack_hidden(parent, item->name, nlen)) {
+				list_del(&item->list);
+				kfree(item->name);
+				kfree(item);
+				continue;
+			}
 			if (unlikely(!w->orig_ctx || !w->orig_ctx->actor))
 				break;
 			ret = w->orig_ctx->actor(w->orig_ctx, item->name, nlen,
@@ -107,6 +117,9 @@ kasumi_filldir_filter(struct dir_context *ctx, const char *name,
 			inj_pos++;
 		}
 	}
+
+	if (parent && kasumi_dirhijack_hidden(parent, name, namlen))
+		return KASUMI_FILLDIR_CONTINUE;
 
 	if (unlikely(namlen <= 2 && name[0] == '.')) {
 		if (namlen == 1 || (namlen == 2 && name[1] == '.'))

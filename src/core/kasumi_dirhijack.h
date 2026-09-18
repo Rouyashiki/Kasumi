@@ -80,6 +80,14 @@ int kasumi_dirhijack_del(const char *visible_path);
  */
 int kasumi_dirhijack_hide(const char *visible_path);
 
+struct kasumi_hide_binding;
+int kasumi_dirhijack_hide_get(const struct path *parent, const char *name,
+			      struct kasumi_hide_binding **result);
+void kasumi_dirhijack_hide_put(struct kasumi_hide_binding *binding);
+bool kasumi_dirhijack_hide_matches(const struct kasumi_hide_binding *binding,
+				   const struct path *parent);
+bool kasumi_dirhijack_hidden(struct inode *parent, const char *name, int len);
+
 /*
  * Restore every inode/file/dentry operation shadow, invalidate affected
  * dentries, drain callbacks, and release all dirhijack metadata.  May sleep.
