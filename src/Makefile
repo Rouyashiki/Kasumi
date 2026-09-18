@@ -23,6 +23,8 @@ kasumi_lkm-objs := \
 	core/kasumi_fop_bridge.o \
 	core/kasumi_vnode.o \
 	core/kasumi_dirhijack.o \
+	core/kasumi_hide_events.o \
+	core/kasumi_hide_rules.o \
 	core/kasumi_sop_shadow.o \
 	core/kasumi_root_detection.o \
 	control/kasumi_ioctl.o \

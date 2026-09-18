@@ -26,6 +26,7 @@
 #include "kasumi_vfs_hooks.h"
 #include "kasumi_iop_override.h"
 #include "kasumi_dirhijack.h"
+#include "kasumi_hide_rules.h"
 #include "kasumi_sop_shadow.h"
 #include "kasumi_fop_override.h"
 #include "kasumi_fake_mountinfo.h"
@@ -390,6 +391,9 @@ void kasumi_bootstrap_exit(void)
 {
 	pr_info("Kasumi: shutting down\n");
 	WARN_ON_ONCE(READ_ONCE(kasumi_unload_pin_held));
+	mutex_lock(&kasumi_mutation_mutex);
+	kasumi_hide_rules_stop();
+	mutex_unlock(&kasumi_mutation_mutex);
 
 	/*
 	 * The path view is served entirely through the VFS lookup/vnode layer and

@@ -48,6 +48,7 @@
 #include <asm/unistd.h>
 #include "kasumi_runtime.h"
 #include "kasumi_dirhijack.h"
+#include "kasumi_hide_rules.h"
 #include "kasumi_vnode.h"
 #include "kasumi_bootstrap.h"
 #include "kasumi_store.h"
@@ -460,6 +461,7 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 	int ret = 0;
 
 	if (cmd == KSM_IOC_CLEAR_ALL) {
+		kasumi_hide_rules_clear();
 		mutex_lock(&kasumi_config_mutex);
 		kasumi_cleanup_locked();
 		mutex_unlock(&kasumi_config_mutex);
@@ -543,6 +545,7 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		}
 		kasumi_log("Kasumi %s\n", READ_ONCE(kasumi_enabled) ?
 			   "enabled" : "disabled");
+		kasumi_hide_rules_changed();
 		return 0;
 	}
 
@@ -939,6 +942,8 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 	if (cmd == KSM_IOC_GET_FEATURES) {
 		int features = kasumi_bootstrap_quiesce_supported() ?
 			KSM_FEATURE_QUIESCE : 0;
+		if (kasumi_hide_rules_available())
+			features |= KSM_FEATURE_MANAGED_HIDE;
 		features |= KSM_FEATURE_KSTAT_SPOOF;
 		features |= KSM_FEATURE_MERGE_DIR;
 		if (kasumi_getxattr_kprobe_registered)
@@ -1611,10 +1616,11 @@ del_done:
  * concurrent CLEAR_ALL cannot return while an older update is still applying
  * those side effects or re-enable the module afterwards.
  */
-static DEFINE_MUTEX(kasumi_ioctl_mutex);
+
 static atomic_t kasumi_control_files = ATOMIC_INIT(0);
 static u32 kasumi_quiesce_state = KSM_QUIESCE_STATE_ACTIVE;
 static int kasumi_quiesce_error;
+static bool kasumi_views_stopped;
 
 static bool kasumi_control_accepting(void)
 {
@@ -1623,12 +1629,15 @@ static bool kasumi_control_accepting(void)
 
 static void kasumi_quiesce_stop_new(void)
 {
-	if (READ_ONCE(kasumi_quiesce_state) != KSM_QUIESCE_STATE_ACTIVE)
+	if (READ_ONCE(kasumi_quiesce_state) == KSM_QUIESCE_STATE_ACTIVE)
+		WRITE_ONCE(kasumi_quiesce_state, KSM_QUIESCE_STATE_DRAINING);
+	if (READ_ONCE(kasumi_quiesce_state) != KSM_QUIESCE_STATE_DRAINING ||
+	    kasumi_views_stopped)
 		return;
-	WRITE_ONCE(kasumi_quiesce_state, KSM_QUIESCE_STATE_DRAINING);
-
-	/* Stop routed execution before withdrawing any handler-owned state. */
 	smp_store_release(&kasumi_enabled, false);
+	if (!kasumi_hide_rules_quiesce())
+		return;
+	kasumi_views_stopped = true;
 
 	/* No new object may acquire module-owned callbacks after this point. */
 	kasumi_proc_hooks_stop_new();
@@ -1704,13 +1713,12 @@ static int kasumi_ioctl_prepare_unload(void __user *arg)
 		a.busy_mask |= KSM_QUIESCE_BUSY_PROC_PROXY;
 	if (control_files != 1)
 		a.busy_mask |= KSM_QUIESCE_BUSY_CONTROL_FD;
-	if (module_refs > known_refs || iop_active || sop_active ||
-	    !iop_quiesced || !sop_quiesced)
+	if (!kasumi_views_stopped || module_refs > known_refs || iop_active ||
+	    sop_active || !iop_quiesced || !sop_quiesced)
 		a.busy_mask |= KSM_QUIESCE_BUSY_OTHER;
 
-	ready = !getfd && !proxies &&
-		iop_quiesced && sop_quiesced && !sop_active &&
-		control_files == 1 &&
+	ready = kasumi_views_stopped && !getfd && !proxies && iop_quiesced &&
+		sop_quiesced && !sop_active && control_files == 1 &&
 		module_refs == control_files + (unload_pin_held ? 1U : 0U);
 
 	if (kasumi_quiesce_error) {
@@ -1751,7 +1759,7 @@ static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
 {
 	long ret;
 
-	mutex_lock(&kasumi_ioctl_mutex);
+	mutex_lock(&kasumi_mutation_mutex);
 	atomic_long_set(&kasumi_ioctl_tgid, (long)task_tgid_vnr(current));
 	if (!kasumi_control_accepting() && cmd != KSM_IOC_GET_VERSION &&
 	    cmd != KSM_IOC_GET_FEATURES && cmd != KSM_IOC_PREPARE_UNLOAD) {
@@ -1759,6 +1767,13 @@ static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
 		goto out;
 	}
 	switch (cmd) {
+	case KSM_IOC_USER_HIDE_UPSERT:
+	case KSM_IOC_USER_HIDE_DELETE:
+	case KSM_IOC_USER_HIDE_QUERY:
+	case KSM_IOC_USER_HIDE_RETRY:
+	case KSM_IOC_USER_HIDE_CLEAR:
+		ret = kasumi_hide_rules_ioctl(cmd, (void __user *)arg);
+		break;
 	case KSM_IOC_GET_VERSION:
 	case KSM_IOC_SET_ENABLED:
 	case KSM_IOC_ADD_RULE:
@@ -1801,7 +1816,7 @@ static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
 	}
 out:
 	atomic_long_set(&kasumi_ioctl_tgid, 0);
-	mutex_unlock(&kasumi_ioctl_mutex);
+	mutex_unlock(&kasumi_mutation_mutex);
 	return ret;
 }
 

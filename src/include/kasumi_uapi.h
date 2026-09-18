@@ -206,6 +206,33 @@ struct kasumi_spoof_kstat {
 #define KSM_FEATURE_MOUNT_HIDE_AGGRESSIVE                                      \
 	(1 << 12) /* mount-ns link projection */
 
+#define KSM_FEATURE_MANAGED_HIDE (1 << 14)
+
+#define KSM_USER_HIDE_PATH_MAX 4096
+#define KSM_USER_HIDE_LIVE 0
+#define KSM_USER_HIDE_SUSPENDED 1
+#define KSM_USER_HIDE_PENDING 0
+#define KSM_USER_HIDE_BINDING 1
+#define KSM_USER_HIDE_BOUND 2
+#define KSM_USER_HIDE_ERROR 3
+
+/* Protocol 17 extension. QUERY returns the first ID greater than rule_id;
+ * rule_id == 0 in the reply marks the end. Paths include a terminating NUL,
+ * excluded from path_len. Input flags and reserved fields must be zero. */
+struct kasumi_user_hide_arg {
+	__u32 size;
+	__u32 flags;
+	__aligned_u64 rule_id;
+	__aligned_u64 generation;
+	__aligned_u64 reserved_id;
+	__u32 management;
+	__u32 binding;
+	__s32 error;
+	__u32 path_len;
+	__aligned_u64 reserved[2];
+	char path[KSM_USER_HIDE_PATH_MAX];
+};
+
 #define KSM_MOUNT_HIDE_MODE_NORMAL     0
 #define KSM_MOUNT_HIDE_MODE_AGGRESSIVE 1
 
@@ -328,5 +355,15 @@ struct kasumi_statfs_spoof_arg {
 /* Idempotent terminal transition; repeat to poll until state is READY. */
 #define KSM_IOC_PREPARE_UNLOAD    _IOWR(KSM_IOC_MAGIC, 37, struct kasumi_quiesce_arg)
 #define KSM_IOC_SET_MOUNT_HIDE_MODE _IOW(KSM_IOC_MAGIC, 38, int)
+
+#define KSM_IOC_USER_HIDE_UPSERT                                               \
+	_IOWR(KSM_IOC_MAGIC, 40, struct kasumi_user_hide_arg)
+#define KSM_IOC_USER_HIDE_DELETE                                               \
+	_IOWR(KSM_IOC_MAGIC, 41, struct kasumi_user_hide_arg)
+#define KSM_IOC_USER_HIDE_QUERY                                                \
+	_IOWR(KSM_IOC_MAGIC, 42, struct kasumi_user_hide_arg)
+#define KSM_IOC_USER_HIDE_CLEAR _IO(KSM_IOC_MAGIC, 43)
+#define KSM_IOC_USER_HIDE_RETRY                                                \
+	_IOWR(KSM_IOC_MAGIC, 44, struct kasumi_user_hide_arg)
 
 #endif /* _KASUMI_UAPI_H */

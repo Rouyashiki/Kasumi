@@ -53,6 +53,7 @@
 #include "kasumi_store.h"
 #include "kasumi_path_policy.h"
 #include "kasumi_dirhijack.h"
+#include "kasumi_hide_rules.h"
 
 #define KASUMI_MEDIA_RW_GID 1023
 
@@ -776,6 +777,8 @@ out:
 
 KASUMI_NOCFI enum kasumi_policy_scope kasumi_policy_current_scope(void)
 {
+	if (kasumi_hide_rules_resolving())
+		return KASUMI_POLICY_SCOPE_NONE;
 	return kasumi_policy_scope_for_uid(__kuid_val(task_uid(current)), true);
 }
 
