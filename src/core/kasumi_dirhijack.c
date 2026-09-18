@@ -517,21 +517,37 @@ static KASUMI_DH_ACTOR_RET KASUMI_NOCFI kasumi_dh_proxy_actor(
 	return ret;
 }
 
-static void kasumi_dh_emit_children(struct dir_context *ctx,
-				    struct kasumi_dh_dir *dir)
+#define KASUMI_DH_EMIT_BATCH 8
+
+struct kasumi_dh_emit_entry {
+	unsigned long ino;
+	u16 name_len;
+	u8 type;
+	char name[NAME_MAX + 1];
+};
+
+static int kasumi_dh_emit_children(struct dir_context *ctx,
+				   struct kasumi_dh_dir *dir)
 {
+	struct kasumi_dh_emit_entry *entries;
 	struct kasumi_dh_child *c;
 	u32 want = kasumi_dh_unpack_pos(ctx->pos);
 	u32 idx = 0;
+	unsigned int count = 0, i;
 
 	if (!kasumi_dh_current_sees())
-		return;
+		return 0;
+	entries = kmalloc_array(KASUMI_DH_EMIT_BATCH, sizeof(*entries),
+				GFP_KERNEL);
+	if (!entries)
+		return -ENOMEM;
 	if (!kasumi_dh_virtual_pos(ctx->pos))
 		ctx->pos = kasumi_dh_pack_pos(0);
+	/* The actor may fault on userspace memory; retain only copied names. */
 	rcu_read_lock();
 	hlist_for_each_entry_rcu(c, &dir->children, node) {
 		u32 cur;
-		u8 dt;
+		struct kasumi_dh_emit_entry *entry;
 
 		if (c->hide || c->lookup_only)
 			continue;	/* suppress-only, or readdir owned by the
@@ -539,14 +555,27 @@ static void kasumi_dh_emit_children(struct dir_context *ctx,
 		cur = idx++;
 		if (cur < want)
 			continue;
-		ctx->pos = kasumi_dh_pack_pos(cur);
-		dt = (c->flags & KASUMI_VNODE_F_DIR) ? DT_DIR :
-		     (c->flags & KASUMI_VNODE_F_LNK) ? DT_LNK : DT_REG;
-		if (!dir_emit(ctx, c->name, c->name_len, (u64)c->v_ino, dt))
+		entry = &entries[count++];
+		entry->ino = c->v_ino;
+		entry->name_len = c->name_len;
+		entry->type = (c->flags & KASUMI_VNODE_F_DIR) ? DT_DIR :
+			      (c->flags & KASUMI_VNODE_F_LNK) ? DT_LNK : DT_REG;
+		memcpy(entry->name, c->name, c->name_len + 1);
+		if (count == KASUMI_DH_EMIT_BATCH)
 			break;
-		ctx->pos = kasumi_dh_pack_pos(cur + 1);
 	}
 	rcu_read_unlock();
+	for (i = 0; i < count; i++) {
+		struct kasumi_dh_emit_entry *entry = &entries[i];
+
+		ctx->pos = kasumi_dh_pack_pos(want + i);
+		if (!dir_emit(ctx, entry->name, entry->name_len, entry->ino,
+			      entry->type))
+			break;
+		ctx->pos = kasumi_dh_pack_pos(want + i + 1);
+	}
+	kfree(entries);
+	return 0;
 }
 
 static int KASUMI_NOCFI
@@ -563,10 +592,8 @@ kasumi_dh_iterate_inner(struct file *file, struct dir_context *ctx,
 		    !kasumi_policy_current_is_hide_target(dn->dir_inode)))
 		return orig->iterate_shared(file, ctx);
 
-	if (kasumi_dh_virtual_pos(ctx->pos)) {
-		kasumi_dh_emit_children(ctx, dn);
-		return 0;
-	}
+	if (kasumi_dh_virtual_pos(ctx->pos))
+		return kasumi_dh_emit_children(ctx, dn);
 
 	proxy.ctx.pos = ctx->pos;
 	proxy.orig = ctx;
@@ -589,8 +616,7 @@ kasumi_dh_iterate_inner(struct file *file, struct dir_context *ctx,
 		return ret;
 
 	ctx->pos = kasumi_dh_pack_pos(0);
-	kasumi_dh_emit_children(ctx, dn);
-	return 0;
+	return kasumi_dh_emit_children(ctx, dn);
 }
 
 static int kasumi_dh_iterate(struct file *file, struct dir_context *ctx,
