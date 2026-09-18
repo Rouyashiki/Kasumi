@@ -115,6 +115,8 @@ struct kasumi_policy_snapshot {
 static struct kasumi_policy_snapshot __rcu *kasumi_policy_current;
 static atomic64_t kasumi_policy_generation = ATOMIC64_INIT(0);
 static struct module *kasumi_ksu_provider_module;
+static struct module *kasumi_ksu_allow_provider_module;
+static bool (*kasumi_ksu_allow_uid_ptr)(uid_t uid);
 static struct module *kasumi_apatch_provider_module;
 static struct module *(*kasumi_module_address_ptr)(unsigned long addr);
 static int (*kasumi_core_kernel_text_ptr)(unsigned long addr);
@@ -183,6 +185,10 @@ static KASUMI_NOCFI bool kasumi_policy_pin_linux_module(unsigned long addr,
 
 static void kasumi_policy_unpin_provider(void)
 {
+	if (kasumi_ksu_allow_provider_module) {
+		module_put(kasumi_ksu_allow_provider_module);
+		kasumi_ksu_allow_provider_module = NULL;
+	}
 	if (kasumi_ksu_provider_module) {
 		module_put(kasumi_ksu_provider_module);
 		kasumi_ksu_provider_module = NULL;
@@ -785,14 +791,28 @@ bool kasumi_hide_storage_parent(const struct inode *parent)
 				 KGIDT_INIT(KASUMI_MEDIA_RW_GID)));
 }
 
-static bool kasumi_hide_scope_allowed(bool storage_managed)
+static KASUMI_NOCFI bool kasumi_hide_scope_allowed(bool storage_managed)
 {
 	long ioctl_tgid;
+	uid_t uid = __kuid_val(current_uid());
+	bool allowed = false;
 
 	/* Pair with enable/disable publication before serving hide rules. */
 	if (!smp_load_acquire(&kasumi_enabled) ||
 	    kasumi_is_privileged_process())
 		return false;
+	if (kasumi_uid_is_app(uid)) {
+		bool (*provider)(uid_t app_uid);
+
+		rcu_read_lock();
+		provider = READ_ONCE(kasumi_ksu_allow_uid_ptr);
+		if (provider && kasumi_policy_effective_owner() ==
+				    KSM_POLICY_OWNER_KERNELSU)
+			allowed = provider(uid);
+		rcu_read_unlock();
+		if (allowed)
+			return false;
+	}
 	/* Storage services need the backing view, not a global hide exemption. */
 	if (storage_managed && in_group_p(KGIDT_INIT(KASUMI_MEDIA_RW_GID)))
 		return false;
@@ -903,6 +923,15 @@ static bool kasumi_policy_prepare_ksu_locked(void)
 			return false;
 		}
 		kasumi_policy_mark_ksu_available();
+		if (!kasumi_ksu_allow_uid_ptr) {
+			addr =
+			    kasumi_lookup_callable_quiet("__ksu_is_allow_uid");
+			if (addr && kasumi_valid_kernel_addr(addr) &&
+			    kasumi_policy_pin_stable_provider(
+				addr, &kasumi_ksu_allow_provider_module))
+				WRITE_ONCE(kasumi_ksu_allow_uid_ptr,
+					   (bool (*)(uid_t))addr);
+		}
 		return true;
 	}
 
@@ -1030,6 +1059,7 @@ bool kasumi_policy_prepare_enable_locked(void)
 void kasumi_policy_disable_provider_locked(void)
 {
 	lockdep_assert_held(&kasumi_config_mutex);
+	WRITE_ONCE(kasumi_ksu_allow_uid_ptr, NULL);
 	WRITE_ONCE(kasumi_ksu_uid_should_umount_ptr, NULL);
 	WRITE_ONCE(kasumi_ap_get_mod_exclude, NULL);
 	kasumi_apatch_policy_lifetime_stable = false;
