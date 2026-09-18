@@ -14,8 +14,14 @@
 #include <linux/path.h>
 #include <linux/stat.h>
 #include <linux/types.h>
+#include <uapi/linux/magic.h>
+
+#ifndef FUSE_SUPER_MAGIC
+#define FUSE_SUPER_MAGIC 0x65735546
+#endif
 
 struct kasumi_entry;
+struct inode;
 struct kasumi_policy_state_arg;
 
 struct kasumi_rule_source {
@@ -65,7 +71,8 @@ int kasumi_policy_reset(void);
 void kasumi_policy_shutdown_locked(void);
 enum kasumi_policy_scope kasumi_policy_current_scope(void);
 bool kasumi_policy_current_is_view_target(void);
-bool kasumi_policy_current_is_hide_target(void);
+bool kasumi_hide_storage_parent(const struct inode *parent);
+bool kasumi_policy_current_is_hide_target(const struct inode *parent);
 bool kasumi_policy_current_is_spoof_target(void);
 bool kasumi_policy_current_is_isolated(void);
 bool kasumi_current_is_selinux_guard_target(void);

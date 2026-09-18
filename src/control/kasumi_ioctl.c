@@ -1437,6 +1437,7 @@ add_rule_done:
 			ret = -ENOMEM;
 			goto hide_done;
 		}
+		new_hide->storage_managed = kasumi_hide_storage_parent(parent_inode);
 		/* Do not publish a rule that the VFS cannot enforce. */
 		ret = kasumi_dirhijack_hide(src);
 		if (ret)
@@ -1454,6 +1455,8 @@ add_rule_done:
 			&kasumi_hide_paths[hash_min(hash, KASUMI_HASH_BITS)], node) {
 			if (hide_entry->path_hash == hash &&
 			    strcmp(hide_entry->path, src) == 0) {
+				WRITE_ONCE(hide_entry->storage_managed,
+					   new_hide->storage_managed);
 				found = true;
 				break;
 			}

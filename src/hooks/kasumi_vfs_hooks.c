@@ -823,7 +823,7 @@ KASUMI_NOCFI struct kasumi_filldir_wrapper *kasumi_iterate_prepare_wrapper(struc
 	if (orig_ctx->actor == kasumi_filldir_filter)
 		return NULL;
 	scope = kasumi_policy_current_scope();
-	hide_allowed = kasumi_policy_current_is_hide_target();
+	hide_allowed = kasumi_policy_current_is_hide_target(file ? file_inode(file) : NULL);
 	if (scope == KASUMI_POLICY_SCOPE_NONE && !hide_allowed)
 		return NULL;
 

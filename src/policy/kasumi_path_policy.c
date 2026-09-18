@@ -53,6 +53,9 @@
 #include "kasumi_store.h"
 #include "kasumi_path_policy.h"
 #include "kasumi_dirhijack.h"
+
+#define KASUMI_MEDIA_RW_GID 1023
+
 /* ======================================================================
  * Part 11: Core Logic - Privileged Check / Allowlist
  * ====================================================================== */
@@ -775,7 +778,14 @@ bool kasumi_policy_current_is_view_target(void)
 	return kasumi_policy_current_scope() == KASUMI_POLICY_SCOPE_VIEW;
 }
 
-bool kasumi_policy_current_is_hide_target(void)
+bool kasumi_hide_storage_parent(const struct inode *parent)
+{
+	return parent && (parent->i_sb->s_magic == FUSE_SUPER_MAGIC ||
+			  gid_eq(READ_ONCE(parent->i_gid),
+				 KGIDT_INIT(KASUMI_MEDIA_RW_GID)));
+}
+
+static bool kasumi_hide_scope_allowed(bool storage_managed)
 {
 	long ioctl_tgid;
 
@@ -783,8 +793,16 @@ bool kasumi_policy_current_is_hide_target(void)
 	if (!smp_load_acquire(&kasumi_enabled) ||
 	    kasumi_is_privileged_process())
 		return false;
+	/* Storage services need the backing view, not a global hide exemption. */
+	if (storage_managed && in_group_p(KGIDT_INIT(KASUMI_MEDIA_RW_GID)))
+		return false;
 	ioctl_tgid = atomic_long_read(&kasumi_ioctl_tgid);
 	return ioctl_tgid <= 0 || ioctl_tgid != (long)task_tgid_vnr(current);
+}
+
+bool kasumi_policy_current_is_hide_target(const struct inode *parent)
+{
+	return kasumi_hide_scope_allowed(kasumi_hide_storage_parent(parent));
 }
 
 bool kasumi_policy_current_is_spoof_target(void)
@@ -2126,8 +2144,10 @@ static bool kasumi_hide_rule_matches(const char *pathname)
 	hlist_for_each_entry_rcu(he,
 		&kasumi_hide_paths[hash_min(hash, KASUMI_HASH_BITS)], node) {
 		if (he->path_hash == hash && strcmp(he->path, pathname) == 0) {
+			bool hidden = kasumi_hide_scope_allowed(READ_ONCE(he->storage_managed));
+
 			rcu_read_unlock();
-			return true;
+			return hidden;
 		}
 	}
 	rcu_read_unlock();
@@ -2136,7 +2156,7 @@ static bool kasumi_hide_rule_matches(const char *pathname)
 
 bool kasumi_should_hide(const char *pathname)
 {
-	if (!kasumi_policy_current_is_hide_target())
+	if (!kasumi_hide_scope_allowed(false))
 		return false;
 	return kasumi_hide_rule_matches(pathname);
 }

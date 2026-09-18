@@ -65,6 +65,7 @@ struct kasumi_entry {
 struct kasumi_hide_entry {
 	char *path;
 	u32 path_hash;
+	bool storage_managed;
 	struct hlist_node node;
 	struct rcu_head rcu;
 };

@@ -35,6 +35,8 @@
  */
 #include <linux/dcache.h>
 #include <linux/fs.h>
+#include <linux/kprobes.h>
+#include <uapi/linux/magic.h>
 #include <linux/hashtable.h>
 #include <linux/list.h>
 #include <linux/llist.h>
@@ -164,6 +166,8 @@ static DEFINE_HASHTABLE(kasumi_dh_dops, KASUMI_DH_DOP_HASH_BITS);
 static DEFINE_MUTEX(kasumi_dh_lock);
 DEFINE_STATIC_SRCU(kasumi_dh_srcu);
 static bool kasumi_dh_ready;
+static struct kprobe kasumi_dh_fuse_probe;
+static bool kasumi_dh_fuse_registered;
 
 #define KASUMI_DH_DOP_AUTO_RETIRE	0
 
@@ -177,6 +181,8 @@ static LLIST_HEAD(kasumi_dh_free_children);
 
 static struct dentry *kasumi_dh_lookup(struct inode *dir, struct dentry *dentry,
 				       unsigned int flags);
+static int kasumi_dh_atomic_open(struct inode *dir, struct dentry *dentry,
+				struct file *file, unsigned int flags, umode_t mode);
 static int kasumi_dh_iterate(struct file *file, struct dir_context *ctx,
 			     const struct file_operations *orig, void *data);
 static int kasumi_dh_set_dentry_ops(struct kasumi_dh_dir *dir,
@@ -227,12 +233,98 @@ static bool kasumi_dh_current_sees(void)
 	return kasumi_policy_current_is_view_target();
 }
 
-static bool kasumi_dh_current_targets(const struct kasumi_dh_child *child)
+static bool kasumi_dh_current_targets(const struct kasumi_dh_child *child,
+				    const struct inode *parent)
 {
 	if (child->hide)
 		return kasumi_dirhijack_enabled() &&
-		       kasumi_policy_current_is_hide_target();
+		       kasumi_policy_current_is_hide_target(parent);
 	return kasumi_dh_current_sees();
+}
+
+static bool kasumi_dh_hidden_name(struct inode *parent, const struct qstr *name)
+{
+	struct kasumi_dh_iop *m = kasumi_dh_iop_of(parent);
+	struct kasumi_dh_child *child;
+	bool hidden = false;
+
+	if (!m || !m->dir || !name || READ_ONCE(m->dir->retiring))
+		return false;
+	rcu_read_lock();
+	child = kasumi_dh_find_child(m->dir, name->name, (u16)name->len,
+				    full_name_hash(parent, name->name, name->len));
+	if (child && child->hide)
+		hidden = kasumi_dh_current_targets(child, parent);
+	rcu_read_unlock();
+	return hidden;
+}
+
+static int KASUMI_NOCFI kasumi_dh_atomic_open_inner(struct inode *dir,
+					    struct dentry *dentry, struct file *file,
+					    unsigned int flags, umode_t mode)
+{
+	struct kasumi_dh_iop *m = kasumi_dh_iop_of(dir);
+	const struct inode_operations *orig =
+		m ? m->orig_iop : READ_ONCE(dir->i_op);
+
+	if (kasumi_dh_hidden_name(dir, &dentry->d_name))
+		return -ENOENT;
+	if (!orig || !orig->atomic_open ||
+	    orig->atomic_open == kasumi_dh_atomic_open)
+		return -EOPNOTSUPP;
+	return orig->atomic_open(dir, dentry, file, flags, mode);
+}
+
+static int kasumi_dh_atomic_open(struct inode *dir, struct dentry *dentry,
+				 struct file *file, unsigned int flags, umode_t mode)
+{
+	int idx = srcu_read_lock(&kasumi_dh_srcu);
+	int ret = kasumi_dh_atomic_open_inner(dir, dentry, file, flags, mode);
+
+	srcu_read_unlock(&kasumi_dh_srcu, idx);
+	return ret;
+}
+
+/* READDIRPLUS can publish real dentries without calling the parent lookup. */
+static int kasumi_dh_fuse_revalidate_pre(struct kprobe *probe,
+					 struct pt_regs *regs)
+{
+#ifdef CONFIG_ARM64
+	struct dentry *dentry;
+	struct inode *parent;
+	const struct qstr *name;
+	bool hidden;
+	int idx;
+
+	(void)probe;
+	if (!kasumi_dirhijack_enabled())
+		return 0;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+	parent = (void *)regs->regs[0];
+	name = (void *)regs->regs[1];
+	dentry = (void *)regs->regs[2];
+#else
+	dentry = (void *)regs->regs[0];
+#endif
+	if (!dentry)
+		return 0;
+	idx = srcu_read_lock(&kasumi_dh_srcu);
+	spin_lock(&dentry->d_lock);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 13, 0)
+	parent = d_inode(dentry->d_parent);
+	name = &dentry->d_name;
+#endif
+	hidden = kasumi_dh_hidden_name(parent, name);
+	spin_unlock(&dentry->d_lock);
+	srcu_read_unlock(&kasumi_dh_srcu, idx);
+	if (!hidden)
+		return 0;
+	regs->regs[0] = (unsigned long)-ENOENT;
+	instruction_pointer_set(regs, regs->regs[30]);
+	return 1;
+#else
+	return 0;
+#endif
 }
 
 /* ---- hijacked lookup (SRCU-wrapped) ------------------------------------ */
@@ -260,7 +352,7 @@ static struct dentry *KASUMI_NOCFI kasumi_dh_lookup_inner(struct inode *dir,
 				 (u16)dentry->d_name.len,
 				 full_name_hash(dir, dentry->d_name.name,
 						dentry->d_name.len));
-	if (c && kasumi_dh_current_targets(c)) {
+	if (c && kasumi_dh_current_targets(c, dir)) {
 		if (c->source.dentry) {
 			source = c->source;
 			kasumi_path_get(&source);
@@ -410,7 +502,7 @@ static KASUMI_DH_ACTOR_RET KASUMI_NOCFI kasumi_dh_proxy_actor(
 		 * (inject / hide).  A lookup_only child leaves readdir to the
 		 * overlay filldir, which already emits and dedups the name, so it
 		 * must pass through here untouched. */
-		injected = c && !c->lookup_only && kasumi_dh_current_targets(c);
+		injected = c && !c->lookup_only && kasumi_dh_current_targets(c, p->dir->dir_inode);
 		rcu_read_unlock();
 	}
 	if (injected)
@@ -468,7 +560,7 @@ kasumi_dh_iterate_inner(struct file *file, struct dir_context *ctx,
 	if (!orig || !orig->iterate_shared)
 		return -ENOTDIR;
 	if (!dn || (!kasumi_dh_current_sees() &&
-		    !kasumi_policy_current_is_hide_target()))
+		    !kasumi_policy_current_is_hide_target(dn->dir_inode)))
 		return orig->iterate_shared(file, ctx);
 
 	if (kasumi_dh_virtual_pos(ctx->pos)) {
@@ -593,7 +685,7 @@ kasumi_dh_revalidate_inner(struct kasumi_dh_dop_meta *dm,
 		if (c) {
 			governed = true;
 			child_hide = c->hide;
-			sees = kasumi_dh_current_targets(c);
+			sees = kasumi_dh_current_targets(c, dir);
 		}
 		rcu_read_unlock();
 	}
@@ -1011,6 +1103,8 @@ static struct kasumi_dh_dir *kasumi_dh_install_dir(struct inode *inode,
 	im->orig_iop = orig_iop;
 	im->dir = dir;
 	im->fake_iop.lookup = kasumi_dh_lookup;
+	if (orig_iop->atomic_open)
+		im->fake_iop.atomic_open = kasumi_dh_atomic_open;
 	dir->iop_meta = im;
 
 	if (need_iterate) {
@@ -1374,6 +1468,12 @@ kasumi_dh_register(const char *visible_path, const struct path *source,
 			return kasumi_dh_register_vtopo(visible_path);
 		return ret;
 	}
+	if (hide && ppath.dentry->d_sb->s_magic == FUSE_SUPER_MAGIC &&
+	    !READ_ONCE(kasumi_dh_fuse_registered)) {
+		kasumi_path_put(&ppath);
+		kfree(parent);
+		return -EOPNOTSUPP;
+	}
 	pinode = d_inode(ppath.dentry);
 	if (!pinode || !S_ISDIR(pinode->i_mode)) {
 		kasumi_path_put(&ppath);
@@ -1459,6 +1559,8 @@ int kasumi_dirhijack_add_shadow(const char *visible_path,
  */
 int kasumi_dirhijack_hide(const char *visible_path)
 {
+	if (!kasumi_dirhijack_enabled())
+		return -EOPNOTSUPP;
 	return kasumi_dh_register(visible_path, NULL, 0, 0, true, false);
 }
 
@@ -1688,16 +1790,34 @@ void kasumi_dirhijack_clear(void)
 
 int kasumi_dirhijack_init(void)
 {
+	unsigned long addr = kasumi_lookup_name("fuse_dentry_revalidate");
+	int ret = -EOPNOTSUPP;
+
+#ifdef CONFIG_ARM64
+	if (addr) {
+		kasumi_dh_fuse_probe.addr = (kprobe_opcode_t *)addr;
+		kasumi_dh_fuse_probe.pre_handler = kasumi_dh_fuse_revalidate_pre;
+		ret = register_kprobe(&kasumi_dh_fuse_probe);
+	}
+#endif
+	WRITE_ONCE(kasumi_dh_fuse_registered, !ret);
+	if (ret)
+		pr_warn("kasumi: FUSE hide cache guard unavailable: %d\n", ret);
+
 	hash_init(kasumi_dh_dops);
 	WRITE_ONCE(kasumi_dh_ready, true);
-	pr_info("Kasumi: dirhijack initialized (param=%d)\n",
-		READ_ONCE(kasumi_dirhijack_param));
+	pr_info("Kasumi: dirhijack initialized (param=%d FUSE cache guard=%d)\n",
+		READ_ONCE(kasumi_dirhijack_param), kasumi_dh_fuse_registered);
 	return 0;
 }
 
 void kasumi_dirhijack_stop_new(void)
 {
 	WRITE_ONCE(kasumi_dh_ready, false);
+	if (kasumi_dh_fuse_registered) {
+		unregister_kprobe(&kasumi_dh_fuse_probe);
+		WRITE_ONCE(kasumi_dh_fuse_registered, false);
+	}
 }
 
 void kasumi_dirhijack_exit(void)
