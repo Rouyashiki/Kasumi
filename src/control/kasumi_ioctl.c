@@ -351,6 +351,103 @@ static int kasumi_ioctl_reset_policy(void __user *arg)
 	return ret;
 }
 
+
+static int KASUMI_NOCFI kasumi_resolve_rule_path(char **pathname,
+				struct inode **target_out,
+				struct inode **parent_out)
+{
+	struct path path;
+	struct inode *target = NULL, *parent = NULL;
+	char *buffer, *parent_name = NULL, *resolved = NULL, *text;
+	const char *leaf = NULL;
+	int ret;
+
+	if (!pathname || !*pathname || (*pathname)[0] != '/')
+		return -EINVAL;
+	if (!kasumi_kern_path || !kasumi_d_path)
+		return -EOPNOTSUPP;
+	buffer = kmalloc(PATH_MAX, GFP_KERNEL);
+	if (!buffer)
+		return -ENOMEM;
+	ret = kasumi_kern_path(*pathname, LOOKUP_FOLLOW, &path);
+	if (ret == -ENOENT) {
+		char *slash;
+
+		parent_name = kstrdup(*pathname, GFP_KERNEL);
+		if (!parent_name) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		slash = strrchr(parent_name, '/');
+		leaf = *pathname + (slash - parent_name) + 1;
+		if (!*leaf) {
+			ret = -EINVAL;
+			goto out;
+		}
+		if (slash == parent_name)
+			slash[1] = '\0';
+		else
+			*slash = '\0';
+		ret = kasumi_kern_path(parent_name, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &path);
+		if (ret == -ENOENT) {
+			/* Keep the stored key deletable after its parent disappears. */
+			ret = 0;
+			goto out;
+		}
+	}
+	if (ret)
+		goto out;
+	text = kasumi_d_path(&path, buffer, PATH_MAX);
+	if (IS_ERR(text)) {
+		ret = PTR_ERR(text);
+		goto out_path;
+	}
+	if (text[0] != '/') {
+		ret = -EINVAL;
+		goto out_path;
+	}
+	if (leaf) {
+		size_t prefix = strcmp(text, "/") ? strlen(text) : 0;
+		size_t length = strlen(leaf);
+
+		if (prefix + length + 2 > PATH_MAX) {
+			ret = -ENAMETOOLONG;
+			goto out_path;
+		}
+		resolved = kmalloc(prefix + length + 2, GFP_KERNEL);
+		if (resolved) {
+			memcpy(resolved, text, prefix);
+			resolved[prefix] = '/';
+			memcpy(resolved + prefix + 1, leaf, length + 1);
+		}
+		parent = d_inode(path.dentry);
+	} else {
+		resolved = kstrdup(text, GFP_KERNEL);
+		target = d_inode(path.dentry);
+		parent = d_inode(path.dentry->d_parent);
+	}
+	if (!resolved) {
+		ret = -ENOMEM;
+		goto out_path;
+	}
+	if (target_out && target) {
+		kasumi_ihold(target);
+		*target_out = target;
+	}
+	if (parent_out && parent) {
+		kasumi_ihold(parent);
+		*parent_out = parent;
+	}
+	kfree(*pathname);
+	*pathname = resolved;
+out_path:
+	kasumi_path_put(&path);
+out:
+	kfree(parent_name);
+	kfree(buffer);
+	return ret;
+}
+
 static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 {
 	struct kasumi_syscall_arg req;
@@ -1323,48 +1420,32 @@ add_rule_done:
 	}
 
 	case KSM_IOC_HIDE_RULE: {
-		char *resolved_src = NULL;
-		struct path path;
+		struct kasumi_hide_entry *new_hide = NULL;
 		struct inode *target_inode = NULL;
 		struct inode *parent_inode = NULL;
-		char *tmp_buf;
 
-		if (!src) { ret = -EINVAL; break; }
-
-		tmp_buf = kmalloc(PATH_MAX, GFP_KERNEL);
-		if (!tmp_buf) { ret = -ENOMEM; break; }
-
-		if (kasumi_kern_path(src, LOOKUP_FOLLOW, &path) == 0) {
-			char *res = kasumi_d_path ? kasumi_d_path(&path, tmp_buf, PATH_MAX) : ERR_PTR(-ENOENT);
-			if (!IS_ERR(res))
-				resolved_src = kstrdup(res, GFP_KERNEL);
-			if (d_inode(path.dentry)) {
-				target_inode = d_inode(path.dentry);
-				kasumi_ihold(target_inode);
-			}
-			if (path.dentry->d_parent && d_inode(path.dentry->d_parent)) {
-				parent_inode = d_inode(path.dentry->d_parent);
-				kasumi_ihold(parent_inode);
-			}
-			kasumi_path_put(&path);
+		ret = kasumi_resolve_rule_path(&src, &target_inode, &parent_inode);
+		if (ret)
+			break;
+		new_hide = kzalloc(sizeof(*new_hide), GFP_KERNEL);
+		if (!new_hide) {
+			ret = -ENOMEM;
+			goto hide_done;
 		}
-		kfree(tmp_buf);
-
-		if (resolved_src) {
-			kfree(src);
-			src = resolved_src;
+		new_hide->path = kstrdup(src, GFP_KERNEL);
+		if (!new_hide->path) {
+			ret = -ENOMEM;
+			goto hide_done;
 		}
-		if (target_inode) {
+		/* Do not publish a rule that the VFS cannot enforce. */
+		ret = kasumi_dirhijack_hide(src);
+		if (ret)
+			goto hide_done;
+		if (target_inode)
 			kasumi_mark_inode_hidden(target_inode);
-			iput(target_inode);
-		}
-		if (parent_inode) {
-			if (parent_inode->i_mapping) {
-				set_bit(AS_FLAGS_KASUMI_DIR_HAS_HIDDEN,
-					&parent_inode->i_mapping->flags);
-				(void)kasumi_fop_install(parent_inode);
-			}
-			iput(parent_inode);
+		if (parent_inode && parent_inode->i_mapping) {
+			set_bit(AS_FLAGS_KASUMI_DIR_HAS_HIDDEN,
+				&parent_inode->i_mapping->flags);
 		}
 
 		hash = full_name_hash(NULL, src, strlen(src));
@@ -1378,30 +1459,28 @@ add_rule_done:
 			}
 		}
 		if (!found) {
-			hide_entry = kmalloc(sizeof(*hide_entry), GFP_KERNEL);
-			if (hide_entry) {
-				hide_entry->path = kstrdup(src, GFP_KERNEL);
-				hide_entry->path_hash = hash;
-				if (hide_entry->path) {
-					unsigned long h1 = jhash(src, strlen(src), 0) & (KASUMI_BLOOM_SIZE - 1);
-					unsigned long h2 = jhash(src, strlen(src), 1) & (KASUMI_BLOOM_SIZE - 1);
-					set_bit(h1, kasumi_hide_bloom);
-					set_bit(h2, kasumi_hide_bloom);
-					atomic_inc(&kasumi_hide_count);
-					hlist_add_head_rcu(&hide_entry->node,
-						&kasumi_hide_paths[hash_min(hash, KASUMI_HASH_BITS)]);
-					kasumi_log("hide rule: src=%s\n", src);
-				} else {
-					kfree(hide_entry);
-				}
-			}
+			unsigned long h1 = jhash(src, strlen(src), 0) & (KASUMI_BLOOM_SIZE - 1);
+			unsigned long h2 = jhash(src, strlen(src), 1) & (KASUMI_BLOOM_SIZE - 1);
+
+			new_hide->path_hash = hash;
+			set_bit(h1, kasumi_hide_bloom);
+			set_bit(h2, kasumi_hide_bloom);
+			atomic_inc(&kasumi_hide_count);
+			hlist_add_head_rcu(&new_hide->node,
+				&kasumi_hide_paths[hash_min(hash, KASUMI_HASH_BITS)]);
+			new_hide = NULL;
+			kasumi_log("hide rule: src=%s\n", src);
 		}
 		mutex_unlock(&kasumi_config_mutex);
-		/* Rebind duplicate rules as well, in case lookup was unavailable
-		 * when the rule was first added. Hides emit no injected entries.
-		 */
-		if (kasumi_dirhijack_enabled())
-			(void)kasumi_dirhijack_hide(src);
+hide_done:
+		if (new_hide) {
+			kfree(new_hide->path);
+			kfree(new_hide);
+		}
+		if (target_inode)
+			iput(target_inode);
+		if (parent_inode)
+			iput(parent_inode);
 		break;
 	}
 
@@ -1444,30 +1523,18 @@ add_rule_done:
 	case KSM_IOC_DEL_RULE: {
 		struct inode *del_inode = NULL;
 
-		if (!src) { ret = -EINVAL; break; }
-
-		/* Resolve symlinks so the path matches what ADD_RULE stored */
-		if (kasumi_kern_path) {
-			struct path dpath;
-			if (kasumi_kern_path(src, LOOKUP_FOLLOW, &dpath) == 0) {
-				char *rbuf = kmalloc(PATH_MAX, GFP_KERNEL);
-				if (rbuf && kasumi_d_path) {
-					char *res = kasumi_d_path(&dpath, rbuf, PATH_MAX);
-					if (!IS_ERR(res) && res[0] == '/') {
-						char *resolved = kstrdup(res, GFP_KERNEL);
-						if (resolved) {
-							kfree(src);
-							src = resolved;
-						}
-					}
-				}
-				if (d_inode(dpath.dentry)) {
-					del_inode = d_inode(dpath.dentry);
-					kasumi_ihold(del_inode);
-				}
-				kfree(rbuf);
-				kasumi_path_put(&dpath);
+		ret = kasumi_resolve_rule_path(&src, &del_inode, NULL);
+		if (ret)
+			break;
+		/* Keep indexed state intact if VFS unbinding fails. */
+		if (kasumi_dirhijack_enabled()) {
+			ret = kasumi_dirhijack_del(src);
+			if (ret && ret != -ENOENT) {
+				if (del_inode)
+					iput(del_inode);
+				break;
 			}
+			ret = 0;
 		}
 
 		hash = full_name_hash(NULL, src, strlen(src));
@@ -1509,8 +1576,6 @@ add_rule_done:
 		}
 del_done:
 		mutex_unlock(&kasumi_config_mutex);
-		if (kasumi_dirhijack_enabled())
-			(void)kasumi_dirhijack_del(src);
 		if (del_inode) {
 			if (del_inode->i_mapping)
 				clear_bit(AS_FLAGS_KASUMI_HIDE,
