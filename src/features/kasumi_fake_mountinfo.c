@@ -779,11 +779,8 @@ int KASUMI_NOCFI kasumi_fake_mi_get_snapshot(struct file *file,
 	mutex_lock(&kasumi_mi_snapshot_lock);
 	if (!native_view && owner) {
 		view = kasumi_owner_view_get(owner);
-		if (!view) {
-			ret = -ENOMEM;
-			goto unlock;
-		}
-		if (!view->fallback)
+		/* Owner metadata exhaustion uses the shared fallback too. */
+		if (view && !view->fallback)
 			slot = &view->snapshot;
 	}
 	if (!native_view && *slot) {
@@ -922,6 +919,8 @@ bool kasumi_fake_mi_cached(uid_t owner)
 		if (view)
 			cached = view->fallback ? kasumi_mi_snapshot != NULL
 						: view->snapshot != NULL;
+		else
+			cached = kasumi_mi_snapshot != NULL;
 	}
 	mutex_unlock(&kasumi_mi_snapshot_lock);
 	return cached;
