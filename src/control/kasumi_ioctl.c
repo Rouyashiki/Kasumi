@@ -51,6 +51,7 @@
 #include "kasumi_hide_rules.h"
 #include "kasumi_vnode.h"
 #include "kasumi_bootstrap.h"
+#include "kasumi_instance.h"
 #include "kasumi_store.h"
 #include "kasumi_entrypoints.h"
 #include "kasumi_path_policy.h"
@@ -1762,11 +1763,15 @@ static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
 	mutex_lock(&kasumi_mutation_mutex);
 	atomic_long_set(&kasumi_ioctl_tgid, (long)task_tgid_vnr(current));
 	if (!kasumi_control_accepting() && cmd != KSM_IOC_GET_VERSION &&
-	    cmd != KSM_IOC_GET_FEATURES && cmd != KSM_IOC_PREPARE_UNLOAD) {
+	    cmd != KSM_IOC_GET_FEATURES && cmd != KSM_IOC_PREPARE_UNLOAD &&
+	    cmd != KSM_IOC_WATCH_INSTANCE) {
 		ret = -ESHUTDOWN;
 		goto out;
 	}
 	switch (cmd) {
+	case KSM_IOC_WATCH_INSTANCE:
+		ret = kasumi_instance_watch((void __user *)arg);
+		break;
 	case KSM_IOC_USER_HIDE_UPSERT:
 	case KSM_IOC_USER_HIDE_DELETE:
 	case KSM_IOC_USER_HIDE_QUERY:

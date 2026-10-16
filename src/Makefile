@@ -18,6 +18,8 @@ obj-m += kasumi_lkm.o
 # supersedes was removed.
 kasumi_lkm-objs := \
 	kasumi_main.o \
+	core/kasumi_module_sysfs.o \
+	core/kasumi_instance.o \
 	core/kasumi_bootstrap.o \
 	core/kasumi_runtime.o \
 	core/kasumi_fop_bridge.o \
@@ -43,6 +45,23 @@ kasumi_lkm-objs := \
 kasumi_lkm-$(CONFIG_ARM64) += hooks/arm64/kasumi_patch_memory.o
 
 ccflags-y += -gz=none
+
+# Module sysfs metadata is private to the target kernel. Probe its allocation
+# layout so backports use the matching cleanup, independently of the version.
+kasumi-module-sysfs-src := $(srctree)/kernel/module/sysfs.c
+ifeq ($(wildcard $(kasumi-module-sysfs-src)),)
+kasumi-module-sysfs-src := $(srctree)/kernel/module.c
+endif
+ifneq ($(shell sed -n '/^struct module_notes_attrs {/,/^};/p' $(kasumi-module-sysfs-src) | grep -c 'struct attribute_group grp'),0)
+CFLAGS_core/kasumi_module_sysfs.o += -DKASUMI_MODULE_NOTES_USE_GROUP
+endif
+ifneq ($(shell grep -c 'kfree(sect_attrs->grp.bin_attrs)' $(kasumi-module-sysfs-src)),0)
+CFLAGS_core/kasumi_module_sysfs.o += -DKASUMI_MODULE_SECT_SEPARATE_BIN_ATTRS
+endif
+
+ifneq ($(shell grep -c 'eventfd_signal(struct eventfd_ctx \*ctx)' $(srctree)/include/linux/eventfd.h),0)
+CFLAGS_core/kasumi_instance.o += -DKASUMI_EVENTFD_SIGNAL_NO_COUNT
+endif
 
 # Linux 6.18 exposes the external module source as srcroot when M/MO are
 # used. Older kernels keep using src, which may be relative to srctree.

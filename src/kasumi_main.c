@@ -11,6 +11,8 @@
 #include <linux/version.h>
 
 #include "kasumi_bootstrap.h"
+#include "kasumi_instance.h"
+#include "kasumi_module_sysfs.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Anatdx");
@@ -30,12 +32,18 @@ MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
 
 static int __init kasumi_lkm_init(void)
 {
-	return kasumi_bootstrap_init();
+	int ret = kasumi_bootstrap_init();
+
+	if (ret)
+		return ret;
+	kasumi_module_sysfs_hide();
+	return 0;
 }
 
 static void __exit kasumi_lkm_exit(void)
 {
 	kasumi_bootstrap_exit();
+	kasumi_instance_exit();
 }
 
 module_init(kasumi_lkm_init);

@@ -54,11 +54,6 @@ MODULE_PARM_DESC(kasumi_fscaps, "1=replay a redirected source's file capabilitie
 module_param_named(kasumi_device_sources, kasumi_device_sources_enabled, int, 0644);
 MODULE_PARM_DESC(kasumi_device_sources, "1=serve char/blk/fifo source redirects via a vnode wrapper (default 1).");
 
-static char kasumi_owner_nonce[33];
-module_param_string(kasumi_owner_nonce, kasumi_owner_nonce,
-		    sizeof(kasumi_owner_nonce), 0400);
-MODULE_PARM_DESC(kasumi_owner_nonce, "Per-load userspace ownership token.");
-
 /* Keep ordinary delete_module() out of module_exit until PREPARE_UNLOAD has
  * severed every external callback entry point.  The loader drops its initial
  * reference only after ->init returns, leaving this one lifecycle reference.
