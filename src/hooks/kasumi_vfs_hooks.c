@@ -126,15 +126,11 @@ kasumi_filldir_filter(struct dir_context *ctx, const char *name,
 			goto passthrough;
 	}
 
-	/* Hide real entries that also exist in merge targets. This prevents
-	 * duplicates: the injected version (from populate_injected_list)
-	 * replaces the original, just like original kasumi.c does.
-	 * Skip when merge target IS the dir we're listing (e.g. target path
-	 * resolved to same inode via symlink) - otherwise we'd hide everything.
-	 * This is independent of app-hide policy because explicit merge rules
-	 * must not emit duplicate names even during root/manual validation. */
+	/* Deduplicate real entries only when this observer sees the effective
+	 * injected child. Never deduplicate a directory against itself. */
 	if (kasumi_d_hash_and_lookup && w->merge_target_count > 0 &&
-	    w->parent_dentry) {
+	    w->parent_dentry &&
+	    kasumi_merge_child_visible(parent, w->dir_path, name, namlen)) {
 		int i;
 		for (i = 0; i < w->merge_target_count; i++) {
 			struct dentry *tgt = w->merge_target_dentries[i];

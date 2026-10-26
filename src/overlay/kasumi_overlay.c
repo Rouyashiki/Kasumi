@@ -91,10 +91,69 @@ void kasumi_add_inject_rule(char *dir)
  * Part 10b: Inject - populate list for merge/add rule dirs
  * ====================================================================== */
 
+/* Called under RCU; a missing exact rule leaves merge-only directories alone.
+ */
+static int kasumi_merge_path_visible(const char *dir, const char *name, int len)
+{
+	struct kasumi_entry *entry;
+	char *path;
+	u32 hash;
+	int visible = -ENOENT;
+
+	path = kasprintf(GFP_ATOMIC, "%s%s%.*s", dir,
+			 !strcmp(dir, "/") ? "" : "/", len, name);
+	if (!path)
+		return -ENOMEM;
+	hash = full_name_hash(NULL, path, strlen(path));
+	hlist_for_each_entry_rcu(
+	    entry, &kasumi_paths[hash_min(hash, KASUMI_HASH_BITS)], node)
+	{
+		if (entry->src_hash == hash && !strcmp(entry->src, path)) {
+			visible = kasumi_rule_current_sees(entry->rule_flags);
+			break;
+		}
+	}
+	kfree(path);
+	return visible;
+}
+
+bool kasumi_merge_child_visible(struct inode *parent, const char *dir,
+				const char *name, int len)
+{
+	struct kasumi_merge_entry *merge;
+	int visible, bkt;
+
+	if (!dir || !name || len <= 0)
+		return false;
+	visible = kasumi_dirhijack_child_visible(parent, name, len);
+	if (visible != -ENOENT)
+		return visible > 0;
+
+	rcu_read_lock();
+	visible = kasumi_merge_path_visible(dir, name, len);
+	if (visible == -ENOENT) {
+		hash_for_each_rcu(kasumi_merge_dirs, bkt, merge, node)
+		{
+			if (!merge->resolved_src ||
+			    strcmp(merge->resolved_src, dir) ||
+			    !strcmp(merge->src, dir))
+				continue;
+			visible =
+			    kasumi_merge_path_visible(merge->src, name, len);
+			if (visible != -ENOENT)
+				break;
+		}
+	}
+	rcu_read_unlock();
+	return visible == -ENOENT || visible > 0;
+}
+
 struct kasumi_merge_ctx {
 	struct dir_context ctx;
 	struct list_head *head;
 	const char *dir_path;
+	const char *visible_dir;
+	struct inode *visible_parent;
 	dev_t dir_dev;
 };
 
@@ -130,6 +189,10 @@ static KASUMI_NOCFI KASUMI_FILLDIR_RET_TYPE kasumi_merge_filldir(struct dir_cont
 	if (namlen == 2 && name[0] == '.' && name[1] == '.')
 		return KASUMI_FILLDIR_CONTINUE;
 	if (namlen == 8 && strncmp(name, ".replace", 8) == 0)
+		return KASUMI_FILLDIR_CONTINUE;
+
+	if (!kasumi_merge_child_visible(mctx->visible_parent, mctx->visible_dir,
+					name, namlen))
 		return KASUMI_FILLDIR_CONTINUE;
 
 	/* Skip whiteout (char dev 0:0) */
@@ -341,12 +404,17 @@ KASUMI_NOCFI void kasumi_populate_injected_list(const char *dir_path, struct den
 								cred);
 				if (!IS_ERR(f)) {
 					struct kasumi_merge_ctx mctx = {
-						.ctx.actor = kasumi_merge_filldir,
-						.head = head,
-						.dir_path = target_node->target,
-						.dir_dev = file_inode(f) &&
-							   file_inode(f)->i_sb ?
-							   file_inode(f)->i_sb->s_dev : 0,
+					    .visible_dir = dir_path,
+					    .visible_parent =
+						parent ? d_inode(parent) : NULL,
+					    .ctx.actor = kasumi_merge_filldir,
+					    .head = head,
+					    .dir_path = target_node->target,
+					    .dir_dev =
+						file_inode(f) &&
+							file_inode(f)->i_sb
+						    ? file_inode(f)->i_sb->s_dev
+						    : 0,
 					};
 					kasumi_this_cpu()->in_populate_inject = 1;
 					iterate_dir(f, &mctx.ctx);

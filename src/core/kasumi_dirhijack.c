@@ -1886,6 +1886,33 @@ bool kasumi_dirhijack_hidden(struct inode *parent, const char *name, int len)
 	return hidden;
 }
 
+KASUMI_NOCFI int kasumi_dirhijack_child_visible(struct inode *parent,
+						const char *name, int len)
+{
+	struct kasumi_dh_iop *meta;
+	struct kasumi_dh_child *child;
+	int visible = -ENOENT;
+	int idx = srcu_read_lock(&kasumi_dh_srcu);
+
+	meta = kasumi_dh_iop_of(parent);
+	if (!meta || !meta->dir)
+		goto out;
+	if (READ_ONCE(meta->dir->retiring)) {
+		visible = 0;
+		goto out;
+	}
+	rcu_read_lock();
+	child = kasumi_dh_find_child(meta->dir, name, (u16)len,
+				     full_name_hash(parent, name, len));
+	if (child)
+		visible = kasumi_dh_current_targets(child, parent) &&
+			  !kasumi_dh_current_hides(child, parent);
+	rcu_read_unlock();
+out:
+	srcu_read_unlock(&kasumi_dh_srcu, idx);
+	return visible;
+}
+
 KASUMI_NOCFI int kasumi_dirhijack_del(const char *visible_path)
 {
 	char *parent = NULL;

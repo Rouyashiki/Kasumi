@@ -86,6 +86,11 @@ int kasumi_dirhijack_hide_get(const struct path *parent, const char *name,
 void kasumi_dirhijack_hide_put(struct kasumi_hide_binding *binding);
 bool kasumi_dirhijack_hide_matches(const struct kasumi_hide_binding *binding,
 				   const struct path *parent, u32 flags);
+/* Return 1 for an injected child, 0 for a real/hidden view, -ENOENT if unbound.
+ */
+int kasumi_dirhijack_child_visible(struct inode *parent, const char *name,
+				   int len);
+
 bool kasumi_dirhijack_hidden(struct inode *parent, const char *name, int len);
 
 /*
