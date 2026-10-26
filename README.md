@@ -11,9 +11,33 @@ It provides path redirection, hiding, directory merge/injection, and scoped proc
 - Repository type: LKM, not an in-tree kernel patch set
 - Implementation: `src/`
 - Userspace ABI: `src/include/kasumi_uapi.h`
-- Protocol: `KSM_PROTOCOL_VERSION = 17`
+- Protocol: `KSM_PROTOCOL_VERSION = 18`
 - Path view: VFS lookup/vnode based; there is no syscall-table dispatcher or `sys_enter` redirect engine
 - Control entry: root-only `reboot` GET_FD command, followed by fd-based ioctls
+
+## API 18 conflict guard
+
+Mount hiding retains the ordinary behavior. Command 38 and capability bit 12
+are reserved; mount-namespace link projection and mode selection are removed.
+The standalone policy, unload, and instance-watch commands retain their ABI.
+
+Before installing hooks, Kasumi refuses to load alongside `pathmask`,
+`procguard`, `nomount`, or `susfs_guard_lkm`, or when the running IKCONFIG
+contains `CONFIG_KSU_SUSFS=y` or `CONFIG_NOMOUNT=y`. Once loaded, its module
+notifier rejects later conflicting modules before their initialization. The
+guard stays active until all Kasumi hooks and callbacks have been retired;
+turning visibility off does not unload those hooks. Missing module-list/lock
+symbols fail initialization. Unreadable IKCONFIG retains the integrated
+implementation's logged, permissive fallback.
+
+`KSM_IOC_GET_CONFLICTS` (46, `0x8508532e`) reads up to 16 fixed 80-byte records
+in a 1288-byte snapshot. `KSM_IOC_ACK_CONFLICTS` (47, `0x4008532f`) accepts an
+8-byte sequence. GET does not clear events. ACK clears through the displayed
+maximum sequence; newer events survive, zero does nothing, and a future
+sequence returns `EINVAL`. Both remain callable through an existing control fd
+during unload preparation. Records last until this LKM unloads. When the LKM's
+own initialization is refused, its memory is discarded: the loader reports the
+failure and the kernel log identifies the conflicting target.
 
 ## Capabilities
 
@@ -236,7 +260,7 @@ ioctl(fd, KSM_IOC_PREPARE_UNLOAD, &q);
 
 ## Standard Userspace Controller
 
-[Kagami](https://github.com/Rouyashiki/Kagami) is the only standard userspace controller implementation for the current Kasumi ABI. Use its Kasumi client and matching UAPI definitions as the reference when integrating API 17.
+[Kagami](https://github.com/Rouyashiki/Kagami) is the only standard userspace controller implementation for the current Kasumi ABI. Use its Kasumi client and matching UAPI definitions as the reference when integrating API 18.
 
 ## Troubleshooting
 

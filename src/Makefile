@@ -30,6 +30,9 @@ kasumi_lkm-objs := \
 	core/kasumi_sop_shadow.o \
 	core/kasumi_root_detection.o \
 	control/kasumi_ioctl.o \
+	control/kasumi_conflict.o \
+	core/kasumi_module_guard.o \
+	core/kasumi_config_guard.o \
 	policy/kasumi_path_policy.o \
 	overlay/kasumi_overlay.o \
 	hooks/kasumi_proc_hooks.o \

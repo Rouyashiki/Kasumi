@@ -11,18 +11,25 @@
 #define _KASUMI_UAPI_H
 
 #ifdef __KERNEL__
+#include <linux/bits.h>
 #include <linux/ioctl.h>
 #include <linux/types.h>
-#include <linux/bits.h>
 #else
-#include <sys/ioctl.h>
 #include <stddef.h>
 #include <stdint.h>
-#endif // #ifdef __KERNEL__
+#include <sys/ioctl.h>
+#ifdef __linux__
+#include <linux/types.h>
+#else
+typedef uint32_t __u32;
+typedef int32_t __s32;
+#define __aligned_u64 uint64_t __attribute__((aligned(8)))
+#endif
+#endif  // #ifdef __KERNEL__
 
 #define KSM_MAGIC1 0x4B534D31  // "KSM1"
 #define KSM_MAGIC2 0x524F4F54  // "ROOT"
-#define KSM_PROTOCOL_VERSION 17
+#define KSM_PROTOCOL_VERSION 18
 
 #define KSM_MAX_LEN_PATHNAME 256
 
@@ -49,7 +56,7 @@
 /* Marks a directory inode as having shadow file_operations installed for readdir */
 #define AS_FLAGS_KASUMI_FOP_INSTALLED 45
 #define BIT_KASUMI_FOP_INSTALLED BIT(45)
-#endif // #ifdef __KERNEL__
+#endif  // #ifdef __KERNEL__
 
 /* Syscall number: 142 = SYS_reboot on aarch64; we kprobe __arm64_sys_reboot (5.10 compatible). */
 #define KSM_SYSCALL_NR 142
@@ -58,13 +65,13 @@
 #define KSM_CMD_GET_FD 0x48021
 
 struct kasumi_syscall_arg {
-    const char *src;
-    const char *target;
+    const char* src;
+    const char* target;
     int type;
 };
 
 struct kasumi_syscall_list_arg {
-    char *buf;  // Keep as char* for output buffer
+    char* buf;  // Keep as char* for output buffer
     size_t size;
 };
 
@@ -81,68 +88,68 @@ struct kasumi_uid_list_arg {
  * UID policy below. MAGISK is reported for diagnostics but is not currently a
  * supported provider; use MANUAL when running on Magisk.
  */
-#define KSM_POLICY_OWNER_AUTO       0
-#define KSM_POLICY_OWNER_KERNELSU   1
-#define KSM_POLICY_OWNER_APATCH     2
-#define KSM_POLICY_OWNER_MAGISK     3
-#define KSM_POLICY_OWNER_MANUAL     4
-#define KSM_POLICY_OWNER_DISABLED   5
+#define KSM_POLICY_OWNER_AUTO 0
+#define KSM_POLICY_OWNER_KERNELSU 1
+#define KSM_POLICY_OWNER_APATCH 2
+#define KSM_POLICY_OWNER_MAGISK 3
+#define KSM_POLICY_OWNER_MANUAL 4
+#define KSM_POLICY_OWNER_DISABLED 5
 
 /* detected_roots bitmask returned by KSM_IOC_GET_POLICY. */
-#define KSM_POLICY_ROOT_KERNELSU          (1U << 0)
+#define KSM_POLICY_ROOT_KERNELSU (1U << 0)
 #define KSM_POLICY_ROOT_KERNELSU_REDIRECT (1U << 1)
-#define KSM_POLICY_ROOT_APATCH            (1U << 2)
-#define KSM_POLICY_ROOT_MAGISK            (1U << 3)
-#define KSM_POLICY_ROOT_MULTI             (1U << 4)
-#define KSM_POLICY_ROOT_NO_PROVIDER       (1U << 5)
+#define KSM_POLICY_ROOT_APATCH (1U << 2)
+#define KSM_POLICY_ROOT_MAGISK (1U << 3)
+#define KSM_POLICY_ROOT_MULTI (1U << 4)
+#define KSM_POLICY_ROOT_NO_PROVIDER (1U << 5)
 
 /* DENY wins over ALLOW for ordinary app UIDs. Isolated UIDs always receive
  * the concealment scope; INCLUDE_ISOLATED_UIDS is retained for ABI stability.
  */
-#define KSM_POLICY_FLAG_USE_ALLOW_UIDS        (1U << 0)
-#define KSM_POLICY_FLAG_USE_DENY_UIDS         (1U << 1)
+#define KSM_POLICY_FLAG_USE_ALLOW_UIDS (1U << 0)
+#define KSM_POLICY_FLAG_USE_DENY_UIDS (1U << 1)
 #define KSM_POLICY_FLAG_INCLUDE_ISOLATED_UIDS (1U << 2)
 
 #define KSM_POLICY_UID_LIST_ALLOW 1
-#define KSM_POLICY_UID_LIST_DENY  2
-#define KSM_POLICY_UID_LIST_ALL   3
+#define KSM_POLICY_UID_LIST_DENY 2
+#define KSM_POLICY_UID_LIST_ALL 3
 
 struct kasumi_policy_config_arg {
-	__u32 version;
-	__u32 size;
-	__u32 owner;
-	__u32 flags;
-	__u32 reserved[4];
-	__s32 err;
+    __u32 version;
+    __u32 size;
+    __u32 owner;
+    __u32 flags;
+    __u32 reserved[4];
+    __s32 err;
 };
 
 struct kasumi_policy_state_arg {
-	__u32 version;
-	__u32 size;
-	__u32 owner;
-	__u32 effective_owner;
-	__u32 flags;
-	__u32 detected_roots;
-	__u32 allow_count;
-	__u32 deny_count;
-	__u32 max_uid_count;
-	/* Covers configured owner, flags, and lists; provider detection is live. */
-	__aligned_u64 generation;
-	__u32 enabled;
-	__u32 reserved[3];
-	__s32 err;
+    __u32 version;
+    __u32 size;
+    __u32 owner;
+    __u32 effective_owner;
+    __u32 flags;
+    __u32 detected_roots;
+    __u32 allow_count;
+    __u32 deny_count;
+    __u32 max_uid_count;
+    /* Covers configured owner, flags, and lists; provider detection is live. */
+    __aligned_u64 generation;
+    __u32 enabled;
+    __u32 reserved[3];
+    __s32 err;
 };
 
 struct kasumi_policy_uid_list_arg {
-	__u32 version;
-	__u32 size;
-	__u32 list;
-	__u32 count;
-	__u32 total;
-	__u32 reserved;
-	__aligned_u64 uids;
-	__aligned_u64 generation; /* configured-policy snapshot generation */
-	__s32 err;
+    __u32 version;
+    __u32 size;
+    __u32 list;
+    __u32 count;
+    __u32 total;
+    __u32 reserved;
+    __aligned_u64 uids;
+    __aligned_u64 generation; /* configured-policy snapshot generation */
+    __s32 err;
 };
 
 /*
@@ -150,16 +157,16 @@ struct kasumi_policy_uid_list_arg {
  * should prefer this over the incremental SET_POLICY/SET_POLICY_UIDS ioctls.
  */
 struct kasumi_policy_replace_arg {
-	__u32 version;
-	__u32 size;
-	__u32 owner;
-	__u32 flags;
-	__u32 allow_count;
-	__u32 deny_count;
-	__aligned_u64 allow_uids;
-	__aligned_u64 deny_uids;
-	__u32 reserved[4];
-	__s32 err;
+    __u32 version;
+    __u32 size;
+    __u32 owner;
+    __u32 flags;
+    __u32 allow_count;
+    __u32 deny_count;
+    __aligned_u64 allow_uids;
+    __aligned_u64 deny_uids;
+    __u32 reserved[4];
+    __s32 err;
 };
 
 /*
@@ -167,44 +174,43 @@ struct kasumi_policy_replace_arg {
  * Similar to susfs sus_kstat but with Kasumi conventions
  */
 struct kasumi_spoof_kstat {
-    unsigned long target_ino;                           /* Target inode number (after mount/overlay) */
-    char target_pathname[KSM_MAX_LEN_PATHNAME];        /* Path to spoof */
-    unsigned long spoofed_ino;                          /* Spoofed inode number */
-    unsigned long spoofed_dev;                          /* Spoofed device number */
-    unsigned int spoofed_nlink;                         /* Spoofed link count */
-    long long spoofed_size;                             /* Spoofed file size */
-    long spoofed_atime_sec;                             /* Spoofed access time (seconds) */
-    long spoofed_atime_nsec;                            /* Spoofed access time (nanoseconds) */
-    long spoofed_mtime_sec;                             /* Spoofed modification time (seconds) */
-    long spoofed_mtime_nsec;                            /* Spoofed modification time (nanoseconds) */
-    long spoofed_ctime_sec;                             /* Spoofed change time (seconds) */
-    long spoofed_ctime_nsec;                            /* Spoofed change time (nanoseconds) */
-    unsigned long spoofed_blksize;                      /* Spoofed block size */
-    unsigned long long spoofed_blocks;                  /* Spoofed block count */
-    int is_static;                                      /* If true, ino won't change after remount */
-    int err;                                            /* Error code for userspace feedback */
+    unsigned long target_ino;                   /* Target inode number (after mount/overlay) */
+    char target_pathname[KSM_MAX_LEN_PATHNAME]; /* Path to spoof */
+    unsigned long spoofed_ino;                  /* Spoofed inode number */
+    unsigned long spoofed_dev;                  /* Spoofed device number */
+    unsigned int spoofed_nlink;                 /* Spoofed link count */
+    long long spoofed_size;                     /* Spoofed file size */
+    long spoofed_atime_sec;                     /* Spoofed access time (seconds) */
+    long spoofed_atime_nsec;                    /* Spoofed access time (nanoseconds) */
+    long spoofed_mtime_sec;                     /* Spoofed modification time (seconds) */
+    long spoofed_mtime_nsec;                    /* Spoofed modification time (nanoseconds) */
+    long spoofed_ctime_sec;                     /* Spoofed change time (seconds) */
+    long spoofed_ctime_nsec;                    /* Spoofed change time (nanoseconds) */
+    unsigned long spoofed_blksize;              /* Spoofed block size */
+    unsigned long long spoofed_blocks;          /* Spoofed block count */
+    int is_static;                              /* If true, ino won't change after remount */
+    int err;                                    /* Error code for userspace feedback */
 };
 
-/*
- * Feature flags for KSM_CMD_GET_FEATURES
- */
-#define KSM_FEATURE_KSTAT_SPOOF    (1 << 0)
+/* Feature flags returned by KSM_IOC_GET_FEATURES. */
+#define KSM_FEATURE_KSTAT_SPOOF (1 << 0)
 /* Bit 1 remains reserved for the removed uname feature. */
 /* Bit 2 remains reserved for the removed cmdline feature. */
 #define KSM_FEATURE_SELINUX_BYPASS (1 << 4)
-#define KSM_FEATURE_MERGE_DIR      (1 << 5)
-#define KSM_FEATURE_MOUNT_HIDE                                                 \
-	(1 << 6) /* use shared proc mount snapshots for isolated readers */
-#define KSM_FEATURE_MAPS_SPOOF    (1 << 7)  /* spoof ino/dev/pathname in /proc/pid/maps (read buffer filter) */
-#define KSM_FEATURE_STATFS_SPOOF  (1 << 8)  /* spoof statfs f_type so direct matches resolved (INCONSISTENT_MOUNT) */
-#define KSM_FEATURE_FAKE_MOUNTINFO                                             \
-	(1 << 9) /* shared donor mount views with normalized propagation IDs   \
-		  */
-#define KSM_FEATURE_SELINUX_FIX (1 << 10) /* hide SELinux oracles from hidden app-zygote and isolated apps */
+#define KSM_FEATURE_MERGE_DIR (1 << 5)
+#define KSM_FEATURE_MOUNT_HIDE (1 << 6) /* use shared proc mount snapshots for isolated readers */
+#define KSM_FEATURE_MAPS_SPOOF \
+    (1 << 7) /* spoof ino/dev/pathname in /proc/pid/maps (read buffer filter) */
+#define KSM_FEATURE_STATFS_SPOOF \
+    (1 << 8) /* spoof statfs f_type so direct matches resolved (INCONSISTENT_MOUNT) */
+#define KSM_FEATURE_FAKE_MOUNTINFO                                       \
+    (1 << 9) /* shared donor mount views with normalized propagation IDs \
+              */
+#define KSM_FEATURE_SELINUX_FIX \
+    (1 << 10) /* hide SELinux oracles from hidden app-zygote and isolated apps */
 #define KSM_FEATURE_FAKE_SELINUXFS KSM_FEATURE_SELINUX_FIX /* compatibility alias */
-#define KSM_FEATURE_QUIESCE     (1 << 11) /* terminal pre-unload quiesce handshake */
-#define KSM_FEATURE_MOUNT_HIDE_AGGRESSIVE                                      \
-	(1 << 12) /* mount-ns link projection */
+#define KSM_FEATURE_QUIESCE (1 << 11) /* terminal pre-unload quiesce handshake */
+/* Bit 12 remains reserved for removed mount namespace link projection. */
 
 #define KSM_FEATURE_MANAGED_HIDE (1 << 14)
 
@@ -220,36 +226,33 @@ struct kasumi_spoof_kstat {
  * rule_id == 0 in the reply marks the end. Paths include a terminating NUL,
  * excluded from path_len. Input flags and reserved fields must be zero. */
 struct kasumi_user_hide_arg {
-	__u32 size;
-	__u32 flags;
-	__aligned_u64 rule_id;
-	__aligned_u64 generation;
-	__aligned_u64 reserved_id;
-	__u32 management;
-	__u32 binding;
-	__s32 error;
-	__u32 path_len;
-	__aligned_u64 reserved[2];
-	char path[KSM_USER_HIDE_PATH_MAX];
+    __u32 size;
+    __u32 flags;
+    __aligned_u64 rule_id;
+    __aligned_u64 generation;
+    __aligned_u64 reserved_id;
+    __u32 management;
+    __u32 binding;
+    __s32 error;
+    __u32 path_len;
+    __aligned_u64 reserved[2];
+    char path[KSM_USER_HIDE_PATH_MAX];
 };
-
-#define KSM_MOUNT_HIDE_MODE_NORMAL     0
-#define KSM_MOUNT_HIDE_MODE_AGGRESSIVE 1
 
 #define KSM_QUIESCE_API_VERSION 1
 
-#define KSM_QUIESCE_STATE_ACTIVE    0
-#define KSM_QUIESCE_STATE_DRAINING  1
-#define KSM_QUIESCE_STATE_READY     2
-#define KSM_QUIESCE_STATE_FAILED    3
+#define KSM_QUIESCE_STATE_ACTIVE 0
+#define KSM_QUIESCE_STATE_DRAINING 1
+#define KSM_QUIESCE_STATE_READY 2
+#define KSM_QUIESCE_STATE_FAILED 3
 
-#define KSM_QUIESCE_BUSY_GETFD       (1U << 0)
-#define KSM_QUIESCE_BUSY_MARKER      (1U << 1)
-#define KSM_QUIESCE_BUSY_REDIRECT    (1U << 2)
-#define KSM_QUIESCE_BUSY_PROC_PROXY  (1U << 3)
-#define KSM_QUIESCE_BUSY_FILE_VIEW   (1U << 4)
-#define KSM_QUIESCE_BUSY_CONTROL_FD  (1U << 5)
-#define KSM_QUIESCE_BUSY_OTHER       (1U << 6)
+#define KSM_QUIESCE_BUSY_GETFD (1U << 0)
+#define KSM_QUIESCE_BUSY_MARKER (1U << 1)
+#define KSM_QUIESCE_BUSY_REDIRECT (1U << 2)
+#define KSM_QUIESCE_BUSY_PROC_PROXY (1U << 3)
+#define KSM_QUIESCE_BUSY_FILE_VIEW (1U << 4)
+#define KSM_QUIESCE_BUSY_CONTROL_FD (1U << 5)
+#define KSM_QUIESCE_BUSY_OTHER (1U << 6)
 
 /* Fixed-size API so an API 17 userspace can probe and poll quiesce safely.
  * READY is a callback-safety barrier; delete_module remains the final liveness
@@ -257,20 +260,20 @@ struct kasumi_user_hide_arg {
  * file without creating another module reference.
  */
 struct kasumi_quiesce_arg {
-	__u32 version;
-	__u32 size;
-	__u32 flags;
-	__u32 state;
-	__u32 busy_mask;
-	__u32 pending_getfd;
-	__u32 pending_marker;
-	__u32 pending_redirect;
-	__u32 live_proc_proxy;
-	__u32 live_file_view;
-	__u32 control_files;
-	__u32 module_refs;
-	__u32 reserved[3];
-	__s32 err;
+    __u32 version;
+    __u32 size;
+    __u32 flags;
+    __u32 state;
+    __u32 busy_mask;
+    __u32 pending_getfd;
+    __u32 pending_marker;
+    __u32 pending_redirect;
+    __u32 live_proc_proxy;
+    __u32 live_file_view;
+    __u32 control_files;
+    __u32 module_refs;
+    __u32 reserved[3];
+    __s32 err;
 };
 
 /* Standalone protocol-17 extension. Supply a fresh, zero-valued eventfd and
@@ -280,10 +283,10 @@ struct kasumi_quiesce_arg {
  * invalid. It does not pin the LKM, and survives terminal unload preparation.
  */
 struct kasumi_instance_arg {
-	__u32 size;
-	__s32 event_fd;
-	__u32 reserved[6];
-	char nonce[32];
+    __u32 size;
+    __s32 event_fd;
+    __u32 reserved[6];
+    char nonce[32];
 };
 
 /*
@@ -291,12 +294,12 @@ struct kasumi_instance_arg {
  * replace ino/dev/pathname with spoofed values. target_dev 0 = match any dev.
  */
 struct kasumi_maps_rule {
-	unsigned long target_ino;
-	unsigned long target_dev;   /* 0 = match any device */
-	unsigned long spoofed_ino;
-	unsigned long spoofed_dev;
-	char spoofed_pathname[KSM_MAX_LEN_PATHNAME];
-	int err;
+    unsigned long target_ino;
+    unsigned long target_dev; /* 0 = match any device */
+    unsigned long spoofed_ino;
+    unsigned long spoofed_dev;
+    char spoofed_pathname[KSM_MAX_LEN_PATHNAME];
+    int err;
 };
 
 /*
@@ -306,80 +309,110 @@ struct kasumi_maps_rule {
  * statfs_spoof: path empty = auto spoof; non-empty = custom path->f_type (future).
  */
 struct kasumi_mount_hide_arg {
-	int enable;
-	char path_pattern[KSM_MAX_LEN_PATHNAME];  /* reserved: empty = all overlay */
-	int err;
+    int enable;
+    char path_pattern[KSM_MAX_LEN_PATHNAME]; /* reserved: empty = all overlay */
+    int err;
 };
 
 struct kasumi_maps_spoof_arg {
-	int enable;
-	/* reserved for future: inline rule, batch config */
-	char reserved[sizeof(struct kasumi_maps_rule)];
-	int err;
+    int enable;
+    /* reserved for future: inline rule, batch config */
+    char reserved[sizeof(struct kasumi_maps_rule)];
+    int err;
 };
 
 struct kasumi_statfs_spoof_arg {
-	int enable;
-	char path[KSM_MAX_LEN_PATHNAME];  /* reserved: empty = auto */
-	unsigned long spoof_f_type;         /* reserved: 0 = use d_real_inode */
-	int err;
+    int enable;
+    char path[KSM_MAX_LEN_PATHNAME]; /* reserved: empty = auto */
+    unsigned long spoof_f_type;      /* reserved: 0 = use d_real_inode */
+    int err;
+};
+
+#define KSM_CONFLICT_MAX 16
+#define KSM_CONFLICT_NAME_LEN 64
+
+#define KSM_CONFLICT_LOADED_MODULE 1
+#define KSM_CONFLICT_BUILTIN_CONFIG 2
+#define KSM_CONFLICT_MODULE_LOAD 3
+
+/* Protocol 18 diagnostics persist for the host module's lifetime. Repeated
+ * (kind, target) pairs replace their sequence; a full queue replaces its oldest
+ * entry. GET does not acknowledge events or activate VFS. Entries are
+ * unordered, target is NUL-terminated, and all reserved fields are zero on
+ * output. */
+struct kasumi_conflict {
+    __aligned_u64 sequence;
+    __u32 kind;
+    __u32 reserved;
+    char target[KSM_CONFLICT_NAME_LEN];
+};
+
+struct kasumi_conflicts_arg {
+    __u32 count;
+    __u32 reserved;
+    struct kasumi_conflict events[KSM_CONFLICT_MAX];
+};
+
+/* Acknowledge through the maximum sequence in the displayed snapshot. Zero is
+ * a no-op; a sequence not yet issued returns -EINVAL. Newer events survive. */
+struct kasumi_conflict_ack_arg {
+    __aligned_u64 sequence;
 };
 
 // ioctl definitions (for fd-based mode)
 // Must be after struct definitions
 #define KSM_IOC_MAGIC 'S'
-#define KSM_IOC_ADD_RULE           _IOW(KSM_IOC_MAGIC, 1, struct kasumi_syscall_arg)
-#define KSM_IOC_DEL_RULE           _IOW(KSM_IOC_MAGIC, 2, struct kasumi_syscall_arg)
-#define KSM_IOC_HIDE_RULE          _IOW(KSM_IOC_MAGIC, 3, struct kasumi_syscall_arg)
-#define KSM_IOC_CLEAR_ALL          _IO(KSM_IOC_MAGIC, 5)
-#define KSM_IOC_GET_VERSION        _IOR(KSM_IOC_MAGIC, 6, int)
-#define KSM_IOC_LIST_RULES         _IOWR(KSM_IOC_MAGIC, 7, struct kasumi_syscall_list_arg)
-#define KSM_IOC_SET_DEBUG          _IOW(KSM_IOC_MAGIC, 8, int)
-#define KSM_IOC_REORDER_MNT_ID     _IO(KSM_IOC_MAGIC, 9)
-#define KSM_IOC_SET_STEALTH        _IOW(KSM_IOC_MAGIC, 10, int)
+#define KSM_IOC_ADD_RULE _IOW(KSM_IOC_MAGIC, 1, struct kasumi_syscall_arg)
+#define KSM_IOC_DEL_RULE _IOW(KSM_IOC_MAGIC, 2, struct kasumi_syscall_arg)
+#define KSM_IOC_HIDE_RULE _IOW(KSM_IOC_MAGIC, 3, struct kasumi_syscall_arg)
+#define KSM_IOC_CLEAR_ALL _IO(KSM_IOC_MAGIC, 5)
+#define KSM_IOC_GET_VERSION _IOR(KSM_IOC_MAGIC, 6, int)
+#define KSM_IOC_LIST_RULES _IOWR(KSM_IOC_MAGIC, 7, struct kasumi_syscall_list_arg)
+#define KSM_IOC_SET_DEBUG _IOW(KSM_IOC_MAGIC, 8, int)
+#define KSM_IOC_REORDER_MNT_ID _IO(KSM_IOC_MAGIC, 9)
+#define KSM_IOC_SET_STEALTH _IOW(KSM_IOC_MAGIC, 10, int)
 #define KSM_IOC_HIDE_OVERLAY_XATTRS _IOW(KSM_IOC_MAGIC, 11, struct kasumi_syscall_arg)
-#define KSM_IOC_ADD_MERGE_RULE     _IOW(KSM_IOC_MAGIC, 12, struct kasumi_syscall_arg)
+#define KSM_IOC_ADD_MERGE_RULE _IOW(KSM_IOC_MAGIC, 12, struct kasumi_syscall_arg)
 /* ABI-reserved legacy slot; pure virtual kernels return -EOPNOTSUPP. */
-#define KSM_IOC_SET_MIRROR_PATH    _IOW(KSM_IOC_MAGIC, 14, struct kasumi_syscall_arg)
-#define KSM_IOC_ADD_SPOOF_KSTAT    _IOW(KSM_IOC_MAGIC, 15, struct kasumi_spoof_kstat)
+#define KSM_IOC_SET_MIRROR_PATH _IOW(KSM_IOC_MAGIC, 14, struct kasumi_syscall_arg)
+#define KSM_IOC_ADD_SPOOF_KSTAT _IOW(KSM_IOC_MAGIC, 15, struct kasumi_spoof_kstat)
 #define KSM_IOC_UPDATE_SPOOF_KSTAT _IOW(KSM_IOC_MAGIC, 16, struct kasumi_spoof_kstat)
 /* Command 18 remains reserved for the removed cmdline operation. */
-#define KSM_IOC_GET_FEATURES       _IOR(KSM_IOC_MAGIC, 19, int)
-#define KSM_IOC_SET_ENABLED        _IOW(KSM_IOC_MAGIC, 20, int)
-#define KSM_IOC_SET_HIDE_UIDS      _IOW(KSM_IOC_MAGIC, 21, struct kasumi_uid_list_arg)
-#define KSM_IOC_GET_HOOKS          _IOWR(KSM_IOC_MAGIC, 22, struct kasumi_syscall_list_arg)
-#define KSM_IOC_ADD_MAPS_RULE     _IOW(KSM_IOC_MAGIC, 23, struct kasumi_maps_rule)
-#define KSM_IOC_CLEAR_MAPS_RULES   _IO(KSM_IOC_MAGIC, 24)
-#define KSM_IOC_SET_MOUNT_HIDE     _IOW(KSM_IOC_MAGIC, 25, struct kasumi_mount_hide_arg)
-#define KSM_IOC_SET_MAPS_SPOOF    _IOW(KSM_IOC_MAGIC, 26, struct kasumi_maps_spoof_arg)
-#define KSM_IOC_SET_STATFS_SPOOF  _IOW(KSM_IOC_MAGIC, 27, struct kasumi_statfs_spoof_arg)
+#define KSM_IOC_GET_FEATURES _IOR(KSM_IOC_MAGIC, 19, int)
+#define KSM_IOC_SET_ENABLED _IOW(KSM_IOC_MAGIC, 20, int)
+#define KSM_IOC_SET_HIDE_UIDS _IOW(KSM_IOC_MAGIC, 21, struct kasumi_uid_list_arg)
+#define KSM_IOC_GET_HOOKS _IOWR(KSM_IOC_MAGIC, 22, struct kasumi_syscall_list_arg)
+#define KSM_IOC_ADD_MAPS_RULE _IOW(KSM_IOC_MAGIC, 23, struct kasumi_maps_rule)
+#define KSM_IOC_CLEAR_MAPS_RULES _IO(KSM_IOC_MAGIC, 24)
+#define KSM_IOC_SET_MOUNT_HIDE _IOW(KSM_IOC_MAGIC, 25, struct kasumi_mount_hide_arg)
+#define KSM_IOC_SET_MAPS_SPOOF _IOW(KSM_IOC_MAGIC, 26, struct kasumi_maps_spoof_arg)
+#define KSM_IOC_SET_STATFS_SPOOF _IOW(KSM_IOC_MAGIC, 27, struct kasumi_statfs_spoof_arg)
 /* Commands 17 and 28 remain reserved for removed uname operations. */
-#define KSM_IOC_SELINUX_FIX       _IOW(KSM_IOC_MAGIC, 29, int)
+#define KSM_IOC_SELINUX_FIX _IOW(KSM_IOC_MAGIC, 29, int)
 /* Policy mutations require SET_ENABLED(0) first and return -EBUSY otherwise. */
-#define KSM_IOC_SET_POLICY        _IOWR(KSM_IOC_MAGIC, 30, struct kasumi_policy_config_arg)
-#define KSM_IOC_SET_POLICY_OWNER  KSM_IOC_SET_POLICY
-#define KSM_IOC_SET_POLICY_UIDS   _IOWR(KSM_IOC_MAGIC, 31, struct kasumi_policy_uid_list_arg)
+#define KSM_IOC_SET_POLICY _IOWR(KSM_IOC_MAGIC, 30, struct kasumi_policy_config_arg)
+#define KSM_IOC_SET_POLICY_OWNER KSM_IOC_SET_POLICY
+#define KSM_IOC_SET_POLICY_UIDS _IOWR(KSM_IOC_MAGIC, 31, struct kasumi_policy_uid_list_arg)
 #define KSM_IOC_CLEAR_POLICY_UIDS _IOWR(KSM_IOC_MAGIC, 32, struct kasumi_policy_uid_list_arg)
-#define KSM_IOC_GET_POLICY        _IOWR(KSM_IOC_MAGIC, 33, struct kasumi_policy_state_arg)
-#define KSM_IOC_GET_POLICY_UIDS   _IOWR(KSM_IOC_MAGIC, 34, struct kasumi_policy_uid_list_arg)
-#define KSM_IOC_REPLACE_POLICY    _IOWR(KSM_IOC_MAGIC, 35, struct kasumi_policy_replace_arg)
+#define KSM_IOC_GET_POLICY _IOWR(KSM_IOC_MAGIC, 33, struct kasumi_policy_state_arg)
+#define KSM_IOC_GET_POLICY_UIDS _IOWR(KSM_IOC_MAGIC, 34, struct kasumi_policy_uid_list_arg)
+#define KSM_IOC_REPLACE_POLICY _IOWR(KSM_IOC_MAGIC, 35, struct kasumi_policy_replace_arg)
 /* Unlike CLEAR_ALL, RESET_POLICY discards the configured policy. */
-#define KSM_IOC_RESET_POLICY      _IOWR(KSM_IOC_MAGIC, 36, struct kasumi_policy_config_arg)
+#define KSM_IOC_RESET_POLICY _IOWR(KSM_IOC_MAGIC, 36, struct kasumi_policy_config_arg)
 /* Idempotent terminal transition; repeat to poll until state is READY. */
-#define KSM_IOC_PREPARE_UNLOAD    _IOWR(KSM_IOC_MAGIC, 37, struct kasumi_quiesce_arg)
-#define KSM_IOC_SET_MOUNT_HIDE_MODE _IOW(KSM_IOC_MAGIC, 38, int)
+#define KSM_IOC_PREPARE_UNLOAD _IOWR(KSM_IOC_MAGIC, 37, struct kasumi_quiesce_arg)
+/* Command 38 remains reserved for removed mount-hide mode selection. */
 
-#define KSM_IOC_USER_HIDE_UPSERT                                               \
-	_IOWR(KSM_IOC_MAGIC, 40, struct kasumi_user_hide_arg)
-#define KSM_IOC_USER_HIDE_DELETE                                               \
-	_IOWR(KSM_IOC_MAGIC, 41, struct kasumi_user_hide_arg)
-#define KSM_IOC_USER_HIDE_QUERY                                                \
-	_IOWR(KSM_IOC_MAGIC, 42, struct kasumi_user_hide_arg)
+#define KSM_IOC_USER_HIDE_UPSERT _IOWR(KSM_IOC_MAGIC, 40, struct kasumi_user_hide_arg)
+#define KSM_IOC_USER_HIDE_DELETE _IOWR(KSM_IOC_MAGIC, 41, struct kasumi_user_hide_arg)
+#define KSM_IOC_USER_HIDE_QUERY _IOWR(KSM_IOC_MAGIC, 42, struct kasumi_user_hide_arg)
 #define KSM_IOC_USER_HIDE_CLEAR _IO(KSM_IOC_MAGIC, 43)
-#define KSM_IOC_USER_HIDE_RETRY                                                \
-	_IOWR(KSM_IOC_MAGIC, 44, struct kasumi_user_hide_arg)
+#define KSM_IOC_USER_HIDE_RETRY _IOWR(KSM_IOC_MAGIC, 44, struct kasumi_user_hide_arg)
 
-#define KSM_IOC_WATCH_INSTANCE                                                \
-	_IOWR(KSM_IOC_MAGIC, 45, struct kasumi_instance_arg)
+#define KSM_IOC_WATCH_INSTANCE _IOWR(KSM_IOC_MAGIC, 45, struct kasumi_instance_arg)
+
+/* Diagnostics remain available while a loaded instance is quiescing. */
+#define KSM_IOC_GET_CONFLICTS _IOR(KSM_IOC_MAGIC, 46, struct kasumi_conflicts_arg)
+#define KSM_IOC_ACK_CONFLICTS _IOW(KSM_IOC_MAGIC, 47, struct kasumi_conflict_ack_arg)
 
 #endif /* _KASUMI_UAPI_H */

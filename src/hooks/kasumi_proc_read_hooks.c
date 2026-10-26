@@ -31,7 +31,6 @@
 #include <linux/list.h>
 #include <linux/atomic.h>
 #include <linux/ctype.h>
-#include <linux/jhash.h>
 #include <linux/namei.h>
 #include <linux/pid.h>
 #include <linux/poll.h>
@@ -123,141 +122,11 @@ static struct kprobe kasumi_kp_fd_install;
 static struct kprobe kasumi_kp_internal_fd_install;
 static bool kasumi_fd_install_registered;
 static bool kasumi_internal_fd_install_registered;
-static u32 kasumi_ns_id_seed;
 static int kasumi_mount_proxy_install_file(
 	struct file *file, enum kasumi_proc_proxy_kind kind,
 	enum kasumi_policy_scope scope);
 static KASUMI_NOCFI int kasumi_mount_proxy_release(struct inode *inode,
 						   struct file *file);
-
-struct kasumi_vfs_readlink_ri_data {
-	char __user *buffer;
-	int buflen;
-	bool candidate;
-};
-
-static u32 kasumi_fake_mnt_ns_id(void)
-{
-	u32 uid = (u32)__kuid_val(current_uid());
-	u32 tgid = (u32)task_tgid_vnr(current);
-	u32 hash = jhash_2words(uid, tgid, READ_ONCE(kasumi_ns_id_seed));
-
-	/* Keep the synthetic inode in the conventional namespace range and stable
-	 * for this process while the module remains loaded.
-	 */
-	return 0xf0001000U + (hash & 0x0007ffffU);
-}
-
-static bool kasumi_current_inherits_root_parent_mnt_ns(void)
-{
-	struct task_struct *parent;
-	struct nsproxy *current_nsproxy = current->nsproxy;
-	bool inherited = false;
-
-	if (!kasumi_policy_current_is_isolated() || !current_nsproxy)
-		return false;
-
-	rcu_read_lock();
-	parent = rcu_dereference(current->real_parent);
-	if (parent) {
-		task_lock(parent);
-		inherited = __kuid_val(task_uid(parent)) == 0 &&
-			parent->nsproxy &&
-			parent->nsproxy->mnt_ns == current_nsproxy->mnt_ns;
-		task_unlock(parent);
-	}
-	rcu_read_unlock();
-	return inherited;
-}
-
-static int kasumi_vfs_readlink_entry(struct kretprobe_instance *ri,
-				     struct pt_regs *regs)
-{
-	struct kasumi_vfs_readlink_ri_data *d = (void *)ri->data;
-	struct dentry *dentry;
-
-	d->buffer = NULL;
-	d->buflen = 0;
-	d->candidate = false;
-
-	if (READ_ONCE(kasumi_mount_hide_mode) !=
-		KSM_MOUNT_HIDE_MODE_AGGRESSIVE ||
-	    !(READ_ONCE(kasumi_feature_enabled_mask) &
-	      KSM_FEATURE_MOUNT_HIDE) ||
-	    !kasumi_fake_mi_active() ||
-	    !kasumi_policy_current_is_spoof_target() ||
-	    !kasumi_current_inherits_root_parent_mnt_ns() ||
-	    kasumi_fake_mi_native_view(NULL))
-		return 0;
-
-#if defined(__aarch64__)
-	dentry = (struct dentry *)regs->regs[0];
-	d->buffer = (char __user *)regs->regs[1];
-	d->buflen = (int)regs->regs[2];
-#elif defined(__x86_64__)
-	dentry = (struct dentry *)regs->di;
-	d->buffer = (char __user *)regs->si;
-	d->buflen = (int)regs->dx;
-#else
-	return 0;
-#endif
-	if (!dentry || !dentry->d_sb ||
-	    dentry->d_sb->s_magic != PROC_SUPER_MAGIC ||
-	    !d->buffer || d->buflen <= 0) {
-		d->buffer = NULL;
-		return 0;
-	}
-
-	d->candidate = true;
-	return 0;
-}
-
-static KASUMI_NOCFI int kasumi_vfs_readlink_ret(
-	struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct kasumi_vfs_readlink_ri_data *d = (void *)ri->data;
-	char original_prefix[sizeof("mnt:[") - 1];
-	char projected[32];
-	long ret;
-	int len;
-
-	if (!d->candidate || !d->buffer)
-		return 0;
-#if defined(__aarch64__)
-	ret = (long)regs->regs[0];
-#elif defined(__x86_64__)
-	ret = (long)regs->ax;
-#else
-	return 0;
-#endif
-	if (ret < (long)sizeof(original_prefix) ||
-	    !kasumi_copy_from_user_nofault || !kasumi_copy_to_user_nofault ||
-	    kasumi_copy_from_user_nofault(original_prefix, d->buffer,
-					 sizeof(original_prefix)) ||
-	    memcmp(original_prefix, "mnt:[", sizeof(original_prefix)) != 0)
-		return 0;
-
-	len = scnprintf(projected, sizeof(projected), "mnt:[%u]",
-			kasumi_fake_mnt_ns_id());
-	len = min(len, d->buflen);
-	if (kasumi_copy_to_user_nofault(d->buffer, projected, len))
-		ret = -EFAULT;
-	else
-		ret = len;
-#if defined(__aarch64__)
-	regs->regs[0] = (unsigned long)ret;
-#elif defined(__x86_64__)
-	regs->ax = (unsigned long)ret;
-#endif
-	return 0;
-}
-
-static struct kretprobe kasumi_krp_vfs_readlink = {
-	.entry_handler = kasumi_vfs_readlink_entry,
-	.handler = kasumi_vfs_readlink_ret,
-	.data_size = sizeof(struct kasumi_vfs_readlink_ri_data),
-	.maxactive = 64,
-};
 
 static enum kasumi_proc_proxy_kind
 kasumi_proc_proxy_kind_for_file(struct file *file,
@@ -1409,7 +1278,6 @@ static struct kretprobe kasumi_krp_get_vfs_caps = {
 
 void kasumi_proc_read_hooks_init(void)
 {
-	unsigned long readlink_addr = kasumi_lookup_name("vfs_readlink");
 	unsigned long fd_install_addr =
 		kasumi_lookup_name_quiet("fd_install");
 	unsigned long internal_fd_install_addr =
@@ -1419,21 +1287,6 @@ void kasumi_proc_read_hooks_init(void)
 
 	atomic_set(&kasumi_proxy_shutdown, 0);
 	atomic_set(&kasumi_proxy_live, 0);
-	kasumi_ns_id_seed = (u32)(unsigned long)&kasumi_krp_vfs_readlink ^
-			    (u32)((unsigned long)&kasumi_krp_vfs_readlink >> 32);
-
-	if (readlink_addr) {
-		kasumi_krp_vfs_readlink.kp.addr =
-			(kprobe_opcode_t *)readlink_addr;
-		if (!register_kretprobe(&kasumi_krp_vfs_readlink)) {
-			kasumi_proc_ns_readlink_registered = 1;
-			pr_info("Kasumi: aggressive mount namespace link projection ready\n");
-		} else {
-			pr_warn("Kasumi: register_kretprobe(vfs_readlink) failed\n");
-		}
-	} else {
-		pr_warn("Kasumi: vfs_readlink not found, aggressive mount hide unavailable\n");
-	}
 
 	if (caps_addr) {
 		kasumi_krp_get_vfs_caps.kp.addr = (kprobe_opcode_t *)caps_addr;
@@ -1496,10 +1349,6 @@ void kasumi_proc_read_hooks_stop_new(void)
 	if (kasumi_fd_install_registered) {
 		unregister_kprobe(&kasumi_kp_fd_install);
 		kasumi_fd_install_registered = false;
-	}
-	if (kasumi_proc_ns_readlink_registered) {
-		unregister_kretprobe(&kasumi_krp_vfs_readlink);
-		kasumi_proc_ns_readlink_registered = 0;
 	}
 	if (kasumi_fscap_kretprobe_registered) {
 		unregister_kretprobe(&kasumi_krp_get_vfs_caps);

@@ -11,9 +11,28 @@ English version: [README.md](./README.md)
 - 仓库形态：LKM，不是 in-tree 内核补丁
 - 内核实现：`src/`
 - 用户态 ABI：`src/include/kasumi_uapi.h`
-- 当前协议：`KSM_PROTOCOL_VERSION = 17`
+- 当前协议：`KSM_PROTOCOL_VERSION = 18`
 - 路径视图：由 VFS lookup/vnode 提供，不再包含 syscall table dispatcher 或 `sys_enter` redirect 引擎
 - 控制入口：root-only `reboot` GET_FD 命令，后续操作全部通过 fd ioctl 完成
+
+## API 18 防冲突保护
+
+挂载隐藏仅保留普通行为，命令 38 和能力位 12 保留，不再提供命名空间链接伪装或模式选择。
+独立版原有的策略、卸载握手和实例监视命令保持 ABI 不变。
+
+安装 hook 前，Kasumi 会拒绝与 `pathmask`、`procguard`、`nomount` 或
+`susfs_guard_lkm` 同时加载；运行内核的 IKCONFIG 包含 `CONFIG_KSU_SUSFS=y`
+或 `CONFIG_NOMOUNT=y` 时也会拒绝加载。加载成功后，通过模块通知器在冲突模块
+初始化前拒绝其加载。保护持续到 Kasumi 的 hook 和回调全部退出；关闭可见性功能
+不会卸载这些 hook。无法获取模块列表或加载锁时拒绝初始化。无法读取 IKCONFIG
+时沿用集成版行为：记录日志并允许初始化。
+
+`KSM_IOC_GET_CONFLICTS`（46，`0x8508532e`）读取最多 16 条、每条 80 字节的记录，
+快照大小为 1288 字节。`KSM_IOC_ACK_CONFLICTS`（47，`0x4008532f`）接收 8 字节序号。
+GET 不清除事件；ACK 仅清除不晚于用户确认快照最大序号的事件，新事件保留。零值不做操作，
+未来序号返回 `EINVAL`。卸载准备期间仍可通过已持有的控制 fd 查询和确认。
+事件保存到此 LKM 卸载为止。若 LKM 自身初始化被拒绝，其内存无法保留：加载器报告失败，
+具体冲突目标记录在内核日志中。
 
 ## 主要能力
 
@@ -236,7 +255,7 @@ ioctl(fd, KSM_IOC_PREPARE_UNLOAD, &q);
 
 ## 标准用户态控制器
 
-[Kagami](https://github.com/Rouyashiki/Kagami) 是当前 Kasumi ABI 唯一的标准用户态控制器实现。接入 API 17 时，应以其中的 Kasumi client 与配套 UAPI 定义作为参考。
+[Kagami](https://github.com/Rouyashiki/Kagami) 是当前 Kasumi ABI 唯一的标准用户态控制器实现。接入 API 18 时，应以其中的 Kasumi client 与配套 UAPI 定义作为参考。
 
 ## 快速排障
 

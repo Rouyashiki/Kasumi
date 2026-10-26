@@ -16,6 +16,8 @@
 #include <linux/vmalloc.h>
 
 #include "kasumi_bootstrap.h"
+#include "kasumi_config_guard.h"
+#include "kasumi_module_guard.h"
 #include "kasumi_runtime.h"
 #include "kasumi_root_detection.h"
 #include "kasumi_path_policy.h"
@@ -299,6 +301,18 @@ int kasumi_bootstrap_init(void)
 	else
 		pr_alert("Kasumi: skipping kallsyms (using per-symbol kprobe)\n");
 
+	ret = kasumi_module_guard_init();
+	if (ret) {
+		pr_err("Kasumi: module conflict guard unavailable: %d\n", ret);
+		goto err_cache;
+	}
+	ret = kasumi_module_guard_acquire();
+	if (ret)
+		goto err_cache;
+	ret = kasumi_check_builtin_conflicts();
+	if (ret)
+		goto err_cache;
+
 	kasumi_root_detect();
 
 	ret = kasumi_resolve_runtime_symbols();
@@ -375,6 +389,8 @@ err_buffers:
 	kasumi_percpu_base = NULL;
 	kasumi_iterate_buf_base = NULL;
 err_cache:
+	kasumi_module_guard_release();
+	kasumi_module_guard_exit();
 	if (kasumi_filldir_cache) {
 		kmem_cache_destroy(kasumi_filldir_cache);
 		kasumi_filldir_cache = NULL;
@@ -423,5 +439,7 @@ void kasumi_bootstrap_exit(void)
 	vfree(kasumi_iterate_buf_base);
 	kasumi_percpu_base = NULL;
 	kasumi_iterate_buf_base = NULL;
+	kasumi_module_guard_release();
+	kasumi_module_guard_exit();
 	pr_alert("Kasumi: Goseichou thank you!!!\n");
 }

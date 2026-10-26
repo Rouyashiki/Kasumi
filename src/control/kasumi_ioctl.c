@@ -51,6 +51,7 @@
 #include "kasumi_hide_rules.h"
 #include "kasumi_vnode.h"
 #include "kasumi_bootstrap.h"
+#include "kasumi_conflict.h"
 #include "kasumi_instance.h"
 #include "kasumi_store.h"
 #include "kasumi_entrypoints.h"
@@ -610,10 +611,7 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		if (kasumi_feature_enabled_mask & KSM_FEATURE_MOUNT_HIDE) {
 			if (written < buf_size)
 				written += scnprintf(kbuf + written, buf_size - written,
-						     "mount_hide enabled mode=%s\n",
-						     READ_ONCE(kasumi_mount_hide_mode) ==
-							     KSM_MOUNT_HIDE_MODE_AGGRESSIVE ?
-							     "aggressive" : "normal");
+						     "mount_hide enabled\n");
 		}
 		if (kasumi_feature_enabled_mask & KSM_FEATURE_MAPS_SPOOF) {
 			if (written < buf_size)
@@ -881,27 +879,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		return 0;
 	}
 
-	if (cmd == KSM_IOC_SET_MOUNT_HIDE_MODE) {
-		int mode;
-
-		if (copy_from_user(&mode, arg, sizeof(mode)))
-			return -EFAULT;
-		if (mode != KSM_MOUNT_HIDE_MODE_NORMAL &&
-		    mode != KSM_MOUNT_HIDE_MODE_AGGRESSIVE)
-			return -EINVAL;
-		if (mode == KSM_MOUNT_HIDE_MODE_AGGRESSIVE &&
-		    (!kasumi_proc_proxy_registered ||
-		     !kasumi_proc_ns_readlink_registered ||
-		     !kasumi_fake_mi_active()))
-			return -EOPNOTSUPP;
-		WRITE_ONCE(kasumi_mount_hide_mode, mode);
-		kasumi_fake_mi_invalidate_all();
-		kasumi_log("mount hide mode: %s\n",
-			   mode == KSM_MOUNT_HIDE_MODE_AGGRESSIVE ?
-			   "aggressive" : "normal");
-		return 0;
-	}
-
 	if (cmd == KSM_IOC_SET_MAPS_SPOOF) {
 		struct kasumi_maps_spoof_arg a;
 		if (copy_from_user(&a, arg, sizeof(a)))
@@ -955,10 +932,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 			features |= KSM_FEATURE_MOUNT_HIDE;
 		if (kasumi_proc_proxy_registered && kasumi_fake_mi_active())
 			features |= KSM_FEATURE_FAKE_MOUNTINFO;
-		if (kasumi_proc_proxy_registered &&
-		    kasumi_proc_ns_readlink_registered &&
-		    kasumi_fake_mi_active())
-			features |= KSM_FEATURE_MOUNT_HIDE_AGGRESSIVE;
 		if (kasumi_proc_proxy_registered)
 			features |= KSM_FEATURE_MAPS_SPOOF;
 		if (kasumi_statfs_kretprobe_registered)
@@ -1044,13 +1017,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		    kasumi_proc_proxy_registered && kasumi_fake_mi_active()
 			? "shared mount pair, normalized propagation IDs"
 			: "none");
-		written += n;
-		n = scnprintf(kbuf + written, buf_size - written,
-			      "mount namespace links: %s\n",
-			      kasumi_proc_ns_readlink_registered ?
-				      (READ_ONCE(kasumi_mount_hide_mode) ==
-				       KSM_MOUNT_HIDE_MODE_AGGRESSIVE ?
-				       "projected" : "available") : "none");
 		written += n;
 
 		/* maps spoof */
@@ -1760,6 +1726,9 @@ static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
 {
 	long ret;
 
+	if (cmd == KSM_IOC_GET_CONFLICTS || cmd == KSM_IOC_ACK_CONFLICTS)
+		return kasumi_conflict_ioctl(cmd, (void __user *)arg);
+
 	mutex_lock(&kasumi_mutation_mutex);
 	atomic_long_set(&kasumi_ioctl_tgid, (long)task_tgid_vnr(current));
 	if (!kasumi_control_accepting() && cmd != KSM_IOC_GET_VERSION &&
@@ -1797,7 +1766,6 @@ static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
 	case KSM_IOC_CLEAR_MAPS_RULES:
 	case KSM_IOC_GET_FEATURES:
 	case KSM_IOC_SET_MOUNT_HIDE:
-	case KSM_IOC_SET_MOUNT_HIDE_MODE:
 	case KSM_IOC_SET_MAPS_SPOOF:
 	case KSM_IOC_SET_STATFS_SPOOF:
 	case KSM_IOC_SELINUX_FIX:
