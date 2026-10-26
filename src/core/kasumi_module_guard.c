@@ -16,6 +16,7 @@ static const char *const conflicting_modules[] = {
     "procguard",
     "nomount",
     "susfs_guard_lkm",
+    "hybridmount",
 };
 
 static struct mutex *loader_mutex;

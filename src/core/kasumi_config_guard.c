@@ -70,7 +70,8 @@ static int kasumi_check_config_data(void)
 	ret = 0;
 	while ((line = strsep(&cursor, "\n"))) {
 		if (!strcmp(line, "CONFIG_KSU_SUSFS=y") ||
-		    !strcmp(line, "CONFIG_NOMOUNT=y")) {
+		    !strcmp(line, "CONFIG_NOMOUNT=y") ||
+		    !strcmp(line, "CONFIG_HYBRIDMOUNT=y")) {
 			pr_warn(
 			    "kasumi: refusing initialization: running kernel "
 			    "has %s\n",

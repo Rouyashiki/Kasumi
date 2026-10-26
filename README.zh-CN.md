@@ -20,9 +20,10 @@ English version: [README.md](./README.md)
 挂载隐藏仅保留普通行为，命令 38 和能力位 12 保留，不再提供命名空间链接伪装或模式选择。
 独立版原有的策略、卸载握手和实例监视命令保持 ABI 不变。
 
-安装 hook 前，Kasumi 会拒绝与 `pathmask`、`procguard`、`nomount` 或
-`susfs_guard_lkm` 同时加载；运行内核的 IKCONFIG 包含 `CONFIG_KSU_SUSFS=y`
-或 `CONFIG_NOMOUNT=y` 时也会拒绝加载。加载成功后，通过模块通知器在冲突模块
+安装 hook 前，Kasumi 会拒绝与 `pathmask`、`procguard`、`nomount`、
+`susfs_guard_lkm` 或 `hybridmount` 同时加载；运行内核的 IKCONFIG 包含
+`CONFIG_KSU_SUSFS=y`、`CONFIG_NOMOUNT=y` 或 `CONFIG_HYBRIDMOUNT=y` 时也会拒绝加载。
+加载成功后，通过模块通知器在冲突模块
 初始化前拒绝其加载。保护持续到 Kasumi 的 hook 和回调全部退出；关闭可见性功能
 不会卸载这些 hook。无法获取模块列表或加载锁时拒绝初始化。无法读取 IKCONFIG
 时沿用集成版行为：记录日志并允许初始化。

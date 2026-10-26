@@ -22,8 +22,9 @@ are reserved; mount-namespace link projection and mode selection are removed.
 The standalone policy, unload, and instance-watch commands retain their ABI.
 
 Before installing hooks, Kasumi refuses to load alongside `pathmask`,
-`procguard`, `nomount`, or `susfs_guard_lkm`, or when the running IKCONFIG
-contains `CONFIG_KSU_SUSFS=y` or `CONFIG_NOMOUNT=y`. Once loaded, its module
+`procguard`, `nomount`, `susfs_guard_lkm`, or `hybridmount`, or when the running
+IKCONFIG contains `CONFIG_KSU_SUSFS=y`, `CONFIG_NOMOUNT=y`, or
+`CONFIG_HYBRIDMOUNT=y`. Once loaded, its module
 notifier rejects later conflicting modules before their initialization. The
 guard stays active until all Kasumi hooks and callbacks have been retired;
 turning visibility off does not unload those hooks. Missing module-list/lock
