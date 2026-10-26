@@ -665,24 +665,83 @@ struct kasumi_virtual_dop {
 	struct rcu_head rcu;
 };
 
+static int kasumi_virtual_revalidate_child(struct inode *dir,
+					   const struct qstr *name,
+					   struct dentry *dentry,
+					   unsigned int flags)
+{
+	const struct kasumi_vnode_info *parent, *info;
+	struct inode *inode;
+	struct path leaf = {};
+	unsigned long lino = 0;
+	char *child;
+	int kind, valid = 0;
+
+	if (flags & LOOKUP_RCU)
+		return -ECHILD;
+	if (!kasumi_vnode_is_ours(dir))
+		return 0;
+	parent = dir->i_private;
+	if (!parent || parent->source.dentry || !parent->visible_path)
+		return 0;
+	child = kstrndup(name->name, name->len, GFP_KERNEL);
+	if (!child)
+		return -ENOMEM;
+	kind = kasumi_rule_vpath_child(parent->visible_path, child, &leaf, NULL,
+				       &lino);
+	kfree(child);
+	if (kind < 0)
+		return kind;
+
+	inode = d_inode(dentry);
+	if (kind == KASUMI_VPATH_NONE)
+		return !inode;
+	info = kasumi_vnode_is_ours(inode) ? inode->i_private : NULL;
+	if (info && kind == KASUMI_VPATH_VDIR && info->visible_path &&
+	    !info->source.dentry &&
+	    (info->flags & KASUMI_VNODE_F_VIRTUAL_DIR)) {
+		size_t len = strlen(parent->visible_path);
+
+		/* Keep a live cwd hashed while this observer still sees the
+		 * same dir. */
+		valid =
+		    strlen(info->visible_path) == len + 1 + name->len &&
+		    !strncmp(info->visible_path, parent->visible_path, len) &&
+		    info->visible_path[len] == '/' &&
+		    !memcmp(info->visible_path + len + 1, name->name,
+			    name->len);
+	} else if (info && kind == KASUMI_VPATH_LEAF) {
+		valid = path_equal(&info->source, &leaf) && info->v_ino == lino;
+	}
+	if (leaf.dentry)
+		kasumi_path_put(&leaf);
+	return valid;
+}
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 static int KASUMI_NOCFI kasumi_virtual_revalidate(struct inode *dir,
 						  const struct qstr *name,
 						  struct dentry *dentry,
 						  unsigned int flags)
 {
-	(void)dir;
-	(void)name;
+	return kasumi_virtual_revalidate_child(dir, name, dentry, flags);
+}
 #else
 static int KASUMI_NOCFI kasumi_virtual_revalidate(struct dentry *dentry,
 						  unsigned int flags)
 {
-#endif
-	(void)dentry;
-	(void)flags;
-	/* A shared virtual parent can contain rules with different policies. */
-	return 0;
+	struct dentry *parent;
+	int ret;
+
+	if (flags & LOOKUP_RCU)
+		return -ECHILD;
+	parent = dget_parent(dentry);
+	ret = kasumi_virtual_revalidate_child(d_inode(parent), &dentry->d_name,
+					      dentry, flags);
+	dput(parent);
+	return ret;
 }
+#endif
 
 static int KASUMI_NOCFI kasumi_virtual_delete(const struct dentry *dentry)
 {
@@ -826,6 +885,8 @@ static struct dentry *KASUMI_NOCFI kasumi_vnode_dir_lookup(
 		}
 		kfree(name);
 		module_put(THIS_MODULE);
+		if (kind < 0)
+			return ERR_PTR(kind);
 		if (kind == KASUMI_VPATH_NONE) {
 			d_add(dentry, NULL);
 			return NULL;

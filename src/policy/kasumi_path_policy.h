@@ -112,6 +112,7 @@ enum kasumi_vpath_kind {
  * *leaf_src (caller kasumi_path_put) and fills *leaf_mode / *leaf_ino with the
  * leaf's source identity (the nofollow link for a symlink target).  Non-sleeping
  * apart from a GFP_KERNEL scratch alloc; the rule-table scan runs under RCU.
+ * Returns -ENOMEM if the scratch allocation fails.
  */
 int kasumi_rule_vpath_child(const char *dir, const char *child,
 			    struct path *leaf_src, umode_t *leaf_mode,

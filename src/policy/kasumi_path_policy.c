@@ -1900,7 +1900,7 @@ int KASUMI_NOCFI kasumi_rule_vpath_child(const char *dir, const char *child,
 	clen = strlen(child);
 	full = kmalloc(dlen + 1 + clen + 1, GFP_KERNEL);
 	if (!full)
-		return KASUMI_VPATH_NONE;
+		return -ENOMEM;
 	memcpy(full, dir, dlen);
 	full[dlen] = '/';
 	memcpy(full + dlen + 1, child, clen);
