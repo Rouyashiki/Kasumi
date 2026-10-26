@@ -782,6 +782,22 @@ KASUMI_NOCFI enum kasumi_policy_scope kasumi_policy_current_scope(void)
 	return kasumi_policy_scope_for_uid(__kuid_val(task_uid(current)), true);
 }
 
+bool kasumi_rule_scope_active(void)
+{
+	long tgid = atomic_long_read(&kasumi_ioctl_tgid);
+
+	return smp_load_acquire(&kasumi_enabled) &&
+	       !kasumi_hide_rules_resolving() &&
+	       (tgid <= 0 || tgid != (long)task_tgid_vnr(current));
+}
+
+bool kasumi_rule_current_sees(u32 flags)
+{
+	return kasumi_rule_scope_active() &&
+	       ((flags & KSM_RULE_BYPASS_POLICY) ||
+		kasumi_policy_current_is_view_target());
+}
+
 bool kasumi_policy_current_is_view_target(void)
 {
 	return kasumi_policy_current_scope() == KASUMI_POLICY_SCOPE_VIEW;
@@ -794,11 +810,17 @@ bool kasumi_hide_storage_parent(const struct inode *parent)
 				 KGIDT_INIT(KASUMI_MEDIA_RW_GID)));
 }
 
-static KASUMI_NOCFI bool kasumi_hide_scope_allowed(bool storage_managed)
+static KASUMI_NOCFI bool kasumi_hide_scope_allowed(bool storage_managed,
+						   u32 flags)
 {
 	long ioctl_tgid;
 	uid_t uid = __kuid_val(current_uid());
 	bool allowed = false;
+
+	if (!kasumi_rule_scope_active())
+		return false;
+	if (flags & KSM_RULE_BYPASS_POLICY)
+		return true;
 
 	/* Pair with enable/disable publication before serving hide rules. */
 	if (!smp_load_acquire(&kasumi_enabled) ||
@@ -825,7 +847,13 @@ static KASUMI_NOCFI bool kasumi_hide_scope_allowed(bool storage_managed)
 
 bool kasumi_policy_current_is_hide_target(const struct inode *parent)
 {
-	return kasumi_hide_scope_allowed(kasumi_hide_storage_parent(parent));
+	return kasumi_hide_scope_allowed(kasumi_hide_storage_parent(parent), 0);
+}
+
+bool kasumi_rule_current_hides(const struct inode *parent, u32 flags)
+{
+	return kasumi_hide_scope_allowed(kasumi_hide_storage_parent(parent),
+					 flags);
 }
 
 bool kasumi_policy_current_is_spoof_target(void)
@@ -1085,7 +1113,7 @@ char *kasumi_resolve_target(const char *pathname)
 	pid_t pid;
 
 	if (unlikely(!kasumi_enabled || !pathname ||
-		     !kasumi_policy_current_is_view_target()))
+		     !kasumi_rule_scope_active()))
 		return NULL;
 
 	pid = task_tgid_vnr(current);
@@ -1107,6 +1135,8 @@ char *kasumi_resolve_target(const char *pathname)
 	rcu_read_lock();
 	hlist_for_each_entry_rcu(entry,
 		&kasumi_paths[hash_min(hash, KASUMI_HASH_BITS)], node) {
+		if (!kasumi_rule_current_sees(entry->rule_flags))
+			continue;
 		if (entry->src_hash == hash &&
 		    strcmp(entry->src, pathname) == 0) {
 			target = kstrdup(entry->target, GFP_ATOMIC);
@@ -1427,6 +1457,8 @@ kasumi_directory_rule_source(const char *pathname, size_t path_len,
 		rcu_read_lock();
 		hlist_for_each_entry_rcu(entry,
 			&kasumi_paths[hash_min(hash, KASUMI_HASH_BITS)], node) {
+			if (!kasumi_rule_current_sees(entry->rule_flags))
+				continue;
 			if (entry->src_hash != hash ||
 			    strlen(entry->src) != prefix_len ||
 			    memcmp(entry->src, pathname, prefix_len) != 0 ||
@@ -1560,7 +1592,7 @@ static bool KASUMI_NOCFI kasumi_rule_get_source_flags_depth(
 	bool followed_exact_link = false;
 
 	if (unlikely(!kasumi_enabled || !pathname || !source ||
-		     !kasumi_policy_current_is_view_target()))
+		     !kasumi_rule_scope_active()))
 		return false;
 	pid = task_tgid_vnr(current);
 	if (READ_ONCE(kasumi_daemon_pid) > 0 &&
@@ -1582,6 +1614,8 @@ static bool KASUMI_NOCFI kasumi_rule_get_source_flags_depth(
 		rcu_read_lock();
 		hlist_for_each_entry_rcu(entry,
 			&kasumi_paths[hash_min(hash, KASUMI_HASH_BITS)], node) {
+			if (!kasumi_rule_current_sees(entry->rule_flags))
+				continue;
 			if (entry->src_hash != hash ||
 			    strcmp(entry->src, pathname) != 0)
 				continue;
@@ -1784,6 +1818,8 @@ static KASUMI_NOCFI bool kasumi_rule_get_visible_path_canonical(
 		size_t suffix_length;
 		size_t visible_root_length;
 
+		if (!kasumi_rule_current_sees(entry->rule_flags))
+			continue;
 		if (!entry->source_path_valid || !S_ISDIR(entry->source_mode) ||
 		    !entry->source_canonical)
 			continue;
@@ -1822,6 +1858,32 @@ out:
 
 /* ---- Slice 4c-v2: pure-virtual directory topology rule-table queries ----- */
 
+bool kasumi_rule_vpath_visible(const char *path)
+{
+	struct kasumi_entry *entry;
+	size_t len;
+	int bkt;
+	bool visible = false;
+
+	if (!path || !kasumi_rule_scope_active())
+		return false;
+	if (kasumi_policy_current_is_view_target())
+		return true;
+	len = strlen(path);
+	rcu_read_lock();
+	hash_for_each_rcu(kasumi_paths, bkt, entry, node)
+	{
+		if (entry->src && !strncmp(entry->src, path, len) &&
+		    entry->src[len] == '/' &&
+		    (entry->rule_flags & KSM_RULE_BYPASS_POLICY)) {
+			visible = true;
+			break;
+		}
+	}
+	rcu_read_unlock();
+	return visible;
+}
+
 int KASUMI_NOCFI kasumi_rule_vpath_child(const char *dir, const char *child,
 					 struct path *leaf_src, umode_t *leaf_mode,
 					 unsigned long *leaf_ino)
@@ -1848,6 +1910,8 @@ int KASUMI_NOCFI kasumi_rule_vpath_child(const char *dir, const char *child,
 	rcu_read_lock();
 	/* Exact rule at dir/child -> a leaf redirect. */
 	hash_for_each_rcu(kasumi_paths, bkt, entry, node) {
+		if (!kasumi_rule_current_sees(entry->rule_flags))
+			continue;
 		if (!entry->src || !entry->source_path_valid ||
 		    strcmp(entry->src, full) != 0)
 			continue;
@@ -1876,6 +1940,8 @@ int KASUMI_NOCFI kasumi_rule_vpath_child(const char *dir, const char *child,
 	/* Otherwise, a prefix of some rule -> a deeper virtual directory. */
 	if (kind == KASUMI_VPATH_NONE) {
 		hash_for_each_rcu(kasumi_paths, bkt, entry, node) {
+			if (!kasumi_rule_current_sees(entry->rule_flags))
+				continue;
 			if (!entry->src)
 				continue;
 			if (strncmp(entry->src, full, full_len) == 0 &&
@@ -1911,6 +1977,8 @@ int KASUMI_NOCFI kasumi_rule_vpath_emit(const char *dir, struct list_head *out)
 		struct kasumi_name_list *item, *ex;
 		umode_t m;
 
+		if (!kasumi_rule_current_sees(entry->rule_flags))
+			continue;
 		if (!entry->src)
 			continue;
 		if (strncmp(entry->src, dir, dlen) != 0 || entry->src[dlen] != '/')
@@ -1982,14 +2050,15 @@ bool kasumi_rule_get_visible_path(const struct path *source,
 
 	if (!source || !source->dentry || !source->mnt || !visible_path ||
 	    !visible_path_size || !READ_ONCE(kasumi_enabled) ||
-	    atomic_read(&kasumi_rule_count) == 0 ||
-	    !kasumi_policy_current_is_view_target())
+	    atomic_read(&kasumi_rule_count) == 0 || !kasumi_rule_scope_active())
 		return false;
 
 	rcu_read_lock();
 	hash_for_each_rcu(kasumi_paths, bkt, entry, node) {
 		int depth;
 
+		if (!kasumi_rule_current_sees(entry->rule_flags))
+			continue;
 		if (!entry->source_path_valid || !S_ISDIR(entry->source_mode))
 			continue;
 		depth = kasumi_source_path_depth(source, &entry->source_path);
@@ -2024,7 +2093,8 @@ static bool kasumi_visible_rule_prefix(const char *pathname, size_t length,
 	rcu_read_lock();
 	hlist_for_each_entry_rcu(entry,
 		&kasumi_paths[hash_min(hash, KASUMI_HASH_BITS)], node) {
-		if (entry->src_hash != hash || strlen(entry->src) != length ||
+		if (!kasumi_rule_current_sees(entry->rule_flags) ||
+		    entry->src_hash != hash || strlen(entry->src) != length ||
 		    memcmp(entry->src, pathname, length) != 0 ||
 		    !entry->source_path_valid ||
 		    (directory_only && !S_ISDIR(entry->source_mode)))
@@ -2043,8 +2113,7 @@ bool kasumi_rule_path_is_virtual(const char *pathname)
 	bool exact = true;
 
 	if (!pathname || pathname[0] != '/' || !READ_ONCE(kasumi_enabled) ||
-	    atomic_read(&kasumi_rule_count) == 0 ||
-	    !kasumi_policy_current_is_view_target())
+	    atomic_read(&kasumi_rule_count) == 0 || !kasumi_rule_scope_active())
 		return false;
 	path_len = strlen(pathname);
 	if (!path_len)
@@ -2081,7 +2150,7 @@ KASUMI_NOCFI char *kasumi_resolve_target_slow(const char *pathname)
 		return target;
 
 	if (unlikely(!kasumi_enabled || !pathname || !*pathname ||
-		     !kasumi_policy_current_is_view_target()))
+		     !kasumi_rule_scope_active()))
 		return NULL;
 	pid = task_tgid_vnr(current);
 	if (READ_ONCE(kasumi_daemon_pid) > 0 && pid == READ_ONCE(kasumi_daemon_pid))
@@ -2094,7 +2163,8 @@ KASUMI_NOCFI char *kasumi_resolve_target_slow(const char *pathname)
 	hash_for_each_rcu(kasumi_merge_dirs, bkt, me, node) {
 		size_t src_len;
 
-		if (!me->src || !me->target)
+		if (!kasumi_rule_current_sees(me->rule_flags) || !me->src ||
+		    !me->target)
 			continue;
 		src_len = strlen(me->src);
 		if (path_len <= src_len || pathname[src_len] != '/')
@@ -2177,7 +2247,9 @@ static bool kasumi_hide_rule_matches(const char *pathname)
 	hlist_for_each_entry_rcu(he,
 		&kasumi_hide_paths[hash_min(hash, KASUMI_HASH_BITS)], node) {
 		if (he->path_hash == hash && strcmp(he->path, pathname) == 0) {
-			bool hidden = kasumi_hide_scope_allowed(READ_ONCE(he->storage_managed));
+			bool hidden = kasumi_hide_scope_allowed(
+			    READ_ONCE(he->storage_managed),
+			    READ_ONCE(he->rule_flags));
 
 			rcu_read_unlock();
 			return hidden;
@@ -2189,7 +2261,7 @@ static bool kasumi_hide_rule_matches(const char *pathname)
 
 bool kasumi_should_hide(const char *pathname)
 {
-	if (!kasumi_hide_scope_allowed(false))
+	if (!kasumi_rule_scope_active())
 		return false;
 	return kasumi_hide_rule_matches(pathname);
 }

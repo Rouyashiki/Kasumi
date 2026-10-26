@@ -659,6 +659,79 @@ static int KASUMI_NOCFI kasumi_vnode_dir_iterate(struct file *file,
 	return ret;
 }
 
+struct kasumi_virtual_dop {
+	struct dentry_operations ops;
+	void (*release)(struct dentry *dentry);
+	struct rcu_head rcu;
+};
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+static int KASUMI_NOCFI kasumi_virtual_revalidate(struct inode *dir,
+						  const struct qstr *name,
+						  struct dentry *dentry,
+						  unsigned int flags)
+{
+	(void)dir;
+	(void)name;
+#else
+static int KASUMI_NOCFI kasumi_virtual_revalidate(struct dentry *dentry,
+						  unsigned int flags)
+{
+#endif
+	(void)dentry;
+	(void)flags;
+	/* A shared virtual parent can contain rules with different policies. */
+	return 0;
+}
+
+static int KASUMI_NOCFI kasumi_virtual_delete(const struct dentry *dentry)
+{
+	(void)dentry;
+	return 1;
+}
+
+static void KASUMI_NOCFI kasumi_virtual_dop_free(struct rcu_head *rcu)
+{
+	struct kasumi_virtual_dop *meta =
+	    container_of(rcu, struct kasumi_virtual_dop, rcu);
+	kfree(meta);
+	module_put(THIS_MODULE);
+}
+
+static void KASUMI_NOCFI kasumi_virtual_release(struct dentry *dentry)
+{
+	struct kasumi_virtual_dop *meta =
+	    container_of(dentry->d_op, struct kasumi_virtual_dop, ops);
+	if (meta->release)
+		meta->release(dentry);
+	/* RCU path walks may still hold the copied operations table. */
+	call_rcu(&meta->rcu, kasumi_virtual_dop_free);
+}
+
+static int kasumi_virtual_track_dentry(struct dentry *dentry)
+{
+	struct kasumi_virtual_dop *meta;
+
+	if (dentry->d_op &&
+	    dentry->d_op->d_revalidate == kasumi_virtual_revalidate)
+		return 0;
+	meta = kzalloc(sizeof(*meta), GFP_KERNEL);
+	if (!meta)
+		return -ENOMEM;
+	if (dentry->d_op)
+		meta->ops = *dentry->d_op;
+	meta->release = meta->ops.d_release;
+	meta->ops.d_revalidate = kasumi_virtual_revalidate;
+	meta->ops.d_delete = kasumi_virtual_delete;
+	meta->ops.d_release = kasumi_virtual_release;
+	__module_get(THIS_MODULE);
+	spin_lock(&dentry->d_lock);
+	WRITE_ONCE(dentry->d_op, &meta->ops);
+	dentry->d_flags |= DCACHE_OP_REVALIDATE | DCACHE_OP_DELETE;
+	spin_unlock(&dentry->d_lock);
+	return 0;
+}
+
 static struct dentry *KASUMI_NOCFI kasumi_vnode_dir_lookup(
 	struct inode *dir, struct dentry *dentry, unsigned int flags)
 {
@@ -680,6 +753,15 @@ static struct dentry *KASUMI_NOCFI kasumi_vnode_dir_lookup(
 	if (!name) {
 		module_put(THIS_MODULE);
 		return ERR_PTR(-ENOMEM);
+	}
+
+	if (!info->source.dentry && info->visible_path) {
+		int ret = kasumi_virtual_track_dentry(dentry);
+		if (ret) {
+			kfree(name);
+			module_put(THIS_MODULE);
+			return ERR_PTR(ret);
+		}
 	}
 
 	if (info->source.dentry && info->source.mnt) {

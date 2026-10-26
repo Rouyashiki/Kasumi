@@ -149,6 +149,7 @@ struct kasumi_dh_child {
 	u16 name_len;
 	u8 flags;
 	unsigned int hide_users;
+	unsigned int bypass_hide_users;
 	bool legacy;
 	u8 hide;			/* 1 = suppress-only: negative lookup, no
 					 * vnode, not emitted in readdir (Slice 2) */
@@ -226,13 +227,18 @@ static struct kasumi_dh_child *kasumi_dh_find_child(struct kasumi_dh_dir *dir,
 }
 
 /* True if the current task should see this dir's injected children. */
-static bool kasumi_dh_current_sees(void)
+static bool kasumi_dh_current_sees(const struct kasumi_dh_child *child)
 {
 	if (!kasumi_dirhijack_enabled())
 		return false;
 	if (READ_ONCE(kasumi_dirhijack_force))
 		return true;
-	return kasumi_policy_current_is_view_target();
+	if (child && (child->flags & KASUMI_VNODE_F_VIRTUAL_DIR))
+		return kasumi_rule_vpath_visible(child->vpath);
+	return kasumi_rule_current_sees(
+	    child && (child->flags & KASUMI_VNODE_F_BYPASS)
+		? KSM_RULE_BYPASS_POLICY
+		: 0);
 }
 
 static bool kasumi_dh_current_hides(const struct kasumi_dh_child *child,
@@ -240,7 +246,12 @@ static bool kasumi_dh_current_hides(const struct kasumi_dh_child *child,
 {
 	return (child->hide || READ_ONCE(child->hide_users)) &&
 	       kasumi_dirhijack_enabled() &&
-	       kasumi_policy_current_is_hide_target(parent);
+	       kasumi_rule_current_hides(
+		   parent, ((child->legacy && child->hide &&
+			     (child->flags & KASUMI_VNODE_F_BYPASS)) ||
+			    READ_ONCE(child->bypass_hide_users))
+			       ? KSM_RULE_BYPASS_POLICY
+			       : 0);
 }
 
 static bool kasumi_dh_current_targets(const struct kasumi_dh_child *child,
@@ -248,7 +259,7 @@ static bool kasumi_dh_current_targets(const struct kasumi_dh_child *child,
 {
 	if (kasumi_dh_current_hides(child, parent))
 		return true;
-	return child->legacy && !child->hide && kasumi_dh_current_sees();
+	return child->legacy && !child->hide && kasumi_dh_current_sees(child);
 }
 
 static bool kasumi_dh_hidden_name(struct inode *parent, const struct qstr *name)
@@ -566,7 +577,7 @@ static int kasumi_dh_emit_children(struct dir_context *ctx,
 	{
 		u32 cur;
 		struct kasumi_dh_emit_entry *entry;
-		if (!kasumi_dh_current_sees())
+		if (!kasumi_dh_current_sees(c))
 			continue;
 
 		if (c->hide || c->lookup_only ||
@@ -611,7 +622,7 @@ kasumi_dh_iterate_inner(struct file *file, struct dir_context *ctx,
 
 	if (!orig || !orig->iterate_shared)
 		return -ENOTDIR;
-	if (!dn || (!kasumi_dh_current_sees() &&
+	if (!dn || (!kasumi_rule_scope_active() &&
 		    !kasumi_policy_current_is_hide_target(dn->dir_inode)))
 		return orig->iterate_shared(file, ctx);
 
@@ -635,7 +646,7 @@ kasumi_dh_iterate_inner(struct file *file, struct dir_context *ctx,
 		/* Hidden-only batches must not signal EOF to the caller. */
 		cond_resched();
 	}
-	if (!kasumi_dh_current_sees())
+	if (!kasumi_rule_scope_active())
 		return ret;
 
 	ctx->pos = kasumi_dh_pack_pos(0);
@@ -1300,6 +1311,7 @@ static int kasumi_dh_dir_add_child(struct kasumi_dh_dir *dir, const char *name,
 	c->hide = hide ? 1 : 0;
 	c->legacy = true;
 	c->hide_users = 0;
+	c->bypass_hide_users = 0;
 	c->lookup_only = lookup_only ? 1 : 0;
 	memcpy(c->name, name, len);
 	c->name[len] = '\0';
@@ -1308,6 +1320,7 @@ static int kasumi_dh_dir_add_child(struct kasumi_dh_dir *dir, const char *name,
 	old = kasumi_dh_find_child(dir, name, len, hash);
 	if (old) {
 		c->hide_users = old->hide_users;
+		c->bypass_hide_users = old->bypass_hide_users;
 		hlist_del_rcu(&old->node);
 	}
 	hlist_add_head_rcu(&c->node, &dir->children);
@@ -1609,16 +1622,20 @@ int kasumi_dirhijack_add_shadow(const char *visible_path,
  * Privileged and rule-management lookups retain the real entry.
  * Sleepable context only. Returns 0 or a negative errno.
  */
-int kasumi_dirhijack_hide(const char *visible_path)
+int kasumi_dirhijack_hide(const char *visible_path, u32 rule_flags)
 {
 	if (!kasumi_dirhijack_enabled())
 		return -EOPNOTSUPP;
-	return kasumi_dh_register(visible_path, NULL, 0, 0, true, false);
+	return kasumi_dh_register(
+	    visible_path, NULL, 0,
+	    (rule_flags & KSM_RULE_BYPASS_POLICY) ? KASUMI_VNODE_F_BYPASS : 0,
+	    true, false);
 }
 
 static KASUMI_NOCFI int kasumi_dh_unregister(struct path ppath,
 					     const char *child,
-					     unsigned long su_ino, bool user)
+					     unsigned long su_ino, bool user,
+					     bool bypass)
 {
 	struct kasumi_dh_iop *m;
 	struct kasumi_dh_child *c = NULL, *replacement = NULL;
@@ -1648,6 +1665,7 @@ static KASUMI_NOCFI int kasumi_dh_unregister(struct path ppath,
 			}
 			replacement->hide = 1;
 			replacement->hide_users = c->hide_users;
+			replacement->bypass_hide_users = c->bypass_hide_users;
 			replacement->name_hash = c->name_hash;
 			replacement->name_len = c->name_len;
 			memcpy(replacement->name, c->name, child_len + 1);
@@ -1663,6 +1681,9 @@ static KASUMI_NOCFI int kasumi_dh_unregister(struct path ppath,
 				return -ENOENT;
 			}
 			WRITE_ONCE(c->hide_users, c->hide_users - 1);
+			if (bypass)
+				WRITE_ONCE(c->bypass_hide_users,
+					   c->bypass_hide_users - 1);
 			keep = c->hide_users || c->legacy;
 		}
 		if (c && !keep) {
@@ -1739,19 +1760,22 @@ static KASUMI_NOCFI int kasumi_dh_unregister(struct path ppath,
 }
 
 struct kasumi_hide_binding {
+	bool bypass;
 	struct dentry *parent;
 	char name[];
 };
 
 bool kasumi_dirhijack_hide_matches(const struct kasumi_hide_binding *binding,
-				   const struct path *parent)
+				   const struct path *parent, u32 flags)
 {
-	return binding && binding->parent == parent->dentry &&
+	return binding &&
+	       binding->bypass == !!(flags & KSM_RULE_BYPASS_POLICY) &&
+	       binding->parent == parent->dentry &&
 	       !d_unlinked(binding->parent);
 }
 
 int kasumi_dirhijack_hide_get(const struct path *parent, const char *name,
-			      struct kasumi_hide_binding **result)
+			      u32 flags, struct kasumi_hide_binding **result)
 {
 	struct inode *inode = d_inode(parent->dentry);
 	struct kasumi_hide_binding *binding;
@@ -1776,6 +1800,7 @@ int kasumi_dirhijack_hide_get(const struct path *parent, const char *name,
 	if (!binding)
 		return -ENOMEM;
 	memcpy(binding->name, name, len + 1);
+	binding->bypass = !!(flags & KSM_RULE_BYPASS_POLICY);
 	binding->parent = dget(parent->dentry);
 	mutex_lock(&kasumi_dh_lock);
 	if (!kasumi_dh_iop_of(inode)) {
@@ -1809,6 +1834,9 @@ int kasumi_dirhijack_hide_get(const struct path *parent, const char *name,
 		WRITE_ONCE(child->legacy, false);
 	}
 	WRITE_ONCE(child->hide_users, child->hide_users + 1);
+	if (binding->bypass)
+		WRITE_ONCE(child->bypass_hide_users,
+			   child->bypass_hide_users + 1);
 	qname.hash = full_name_hash(parent->dentry, name, len);
 	cached = d_lookup(parent->dentry, &qname);
 	if (cached) {
@@ -1842,7 +1870,7 @@ void kasumi_dirhijack_hide_put(struct kasumi_hide_binding *binding)
 	/* No long-lived mount reference: ordinary umount must remain possible.
 	 * Keep the superblock alive until the last held dentry is released. */
 	atomic_inc(&sb->s_active);
-	kasumi_dh_unregister(parent, binding->name, 0, true);
+	kasumi_dh_unregister(parent, binding->name, 0, true, binding->bypass);
 	dput(binding->parent);
 	kfree(binding);
 	deactivate_super(sb);
@@ -1871,7 +1899,7 @@ KASUMI_NOCFI int kasumi_dirhijack_del(const char *visible_path)
 	ret =
 	    kasumi_kern_path(parent, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &ppath);
 	if (!ret) {
-		ret = kasumi_dh_unregister(ppath, child, 0, false);
+		ret = kasumi_dh_unregister(ppath, child, 0, false, false);
 		kasumi_path_put(&ppath);
 	} else if (ret == -ENOENT) {
 		ret = 0;

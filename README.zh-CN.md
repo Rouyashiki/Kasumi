@@ -276,3 +276,43 @@ ioctl(fd, KSM_IOC_PREPARE_UNLOAD, &q);
 
 - SPDX：`Apache-2.0 OR GPL-2.0`
 - 详见 `LICENSE`、`LICENSE-GPL-2.0` 与 `NOTICE`
+
+## 规则绕过策略
+
+API 18 将 `kasumi_syscall_arg.type` 的 bit 0 定义为
+`KSM_RULE_BYPASS_POLICY`：`type = 0` 保持原有策略，显式传 `type = 1`
+才让规则的显隐全局生效。API 17 和已有控制器默认将该字段置零，旧规则
+不会自动变成全局规则。结构大小和 ioctl 编码不变；该字段表示标志位，
+不再用作目录项文件类型。
+
+此位用于 `ADD_RULE`、`ADD_MERGE_RULE`、`HIDE_RULE`；未知位返回 `EINVAL`，
+其他命令必须传零。合并目录生成的子规则继承此位。托管用户 hide 在
+`kasumi_user_hide_arg.flags` 的同一位传入 UPSERT，QUERY 返回保存的标志。
+其他托管 hide 请求的输入 flags 仍须为零；RETRY 和存储重新绑定保留原标志。
+
+下发前必须检查 `KSM_FEATURE_RULE_BYPASS`（能力 bit 15，名称 `rule_bypass`）。
+Kagami 会拒绝不支持该能力的 bypass 请求，不会静默退回普通规则。
+
+bypass 对策略排除的进程也生效，包括特权进程和存储服务，但仍遵循 Kasumi
+总开关、退出流程以及内部控制和解析的防递归保护。相邻普通规则继续遵循
+原策略。此位不会改变 mount hide、maps spoof 等其他功能。
+
+Manager 与独立 Kagami WebUI 提供模块、单条规则和用户 hide 开关，默认关闭。
+模块开关作用于该模块下发的全部 Kasumi 规则；路径规则仍采用最长前缀匹配，
+最终 bypass 为“模块开关或选中路径规则开关”。OverlayFS、Magic Mount 不消费
+此设置。模块修改在下次重建规则时生效，例如 Kasumi 热挂载或下次启动；用户
+hide 保存后立即下发，继续按现有绑定状态显示结果。
+
+```sh
+kagamid module set-bypass example on
+kagamid module add-rule example /system/etc/example kasumi --bypass
+kagamid hide add /data/local/tmp/example --bypass
+kagamid hide list --details
+```
+
+YukiSU 集成版将命令前缀换成 `ksud kagami`。不带 `--bypass` 时写零；
+`set-bypass example off` 关闭模块开关。模块路径规则保存布尔 `bypass`；
+模块和用户 hide 的覆盖值分别在 `module_bypass.json`、`hide_bypass.json`
+中保存为 `"on"`，缺省为关闭。`hide list` 保留字符串数组格式，
+`--details` 返回 `{path, bypass}` 对象。`LIST_RULES` 的 ADD、MERGE、HIDE
+记录末尾报告数值标志。

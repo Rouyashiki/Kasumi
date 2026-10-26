@@ -16,6 +16,7 @@ struct managed_hide_rule {
 	u64 processed;
 	bool deleting;
 	u32 state;
+	u32 flags;
 	int error;
 	struct kasumi_hide_binding *binding;
 	struct kasumi_hide_watch *watches;
@@ -127,16 +128,16 @@ static void hide_workfn(struct work_struct *work)
 			goto next;
 		candidate = NULL;
 		resolved = !ret;
-		same = resolved &&
-		       kasumi_dirhijack_hide_matches(rule->binding, &parent);
+		same = resolved && kasumi_dirhijack_hide_matches(
+				       rule->binding, &parent, rule->flags);
 		if (!ret || ret == -ENOENT || !rule->watches) {
 			kasumi_hide_events_unwatch(rule->watches);
 			rule->watches = watches;
 			watches = NULL;
 		}
 		if (resolved && !same)
-			ret = kasumi_dirhijack_hide_get(&parent, rule->name,
-							&candidate);
+			ret = kasumi_dirhijack_hide_get(
+			    &parent, rule->name, rule->flags, &candidate);
 		if (candidate || ret == -ENOENT || ret == -ENOTDIR ||
 		    (resolved && !same)) {
 			kasumi_dirhijack_hide_put(rule->binding);
@@ -262,6 +263,7 @@ static void hide_snapshot(struct kasumi_user_hide_arg *arg,
 	arg->size = sizeof(*arg);
 	if (!rule)
 		return;
+	arg->flags = rule->flags;
 	arg->rule_id = rule->id;
 	arg->generation = rule->generation;
 	arg->management = READ_ONCE(kasumi_enabled) ? KSM_USER_HIDE_LIVE
@@ -288,10 +290,12 @@ long kasumi_hide_rules_ioctl(unsigned int cmd, void __user *user)
 	arg = memdup_user(user, sizeof(*arg));
 	if (IS_ERR(arg))
 		return PTR_ERR(arg);
-	if (arg->size != sizeof(*arg) || arg->flags || arg->generation ||
-	    arg->reserved_id || arg->management || arg->binding || arg->error ||
-	    arg->reserved[0] || arg->reserved[1] ||
-	    arg->path_len >= sizeof(arg->path) || arg->path[arg->path_len] ||
+	if (arg->size != sizeof(*arg) || (arg->flags & ~KSM_RULE_FLAGS_MASK) ||
+	    (cmd != KSM_IOC_USER_HIDE_UPSERT && arg->flags) ||
+	    arg->generation || arg->reserved_id || arg->management ||
+	    arg->binding || arg->error || arg->reserved[0] ||
+	    arg->reserved[1] || arg->path_len >= sizeof(arg->path) ||
+	    arg->path[arg->path_len] ||
 	    strnlen(arg->path, arg->path_len) != arg->path_len) {
 		ret = -EINVAL;
 		goto out;
@@ -379,6 +383,11 @@ long kasumi_hide_rules_ioctl(unsigned int cmd, void __user *user)
 		refcount_set(&match->refs, 1);
 		list_add_tail(&match->list, &hide_rules);
 	}
+	if (match->flags != arg->flags) {
+		match->state = KSM_USER_HIDE_PENDING;
+		match->error = 0;
+	}
+	match->flags = arg->flags;
 retry:
 	match->generation++;
 	match->processed = 0;

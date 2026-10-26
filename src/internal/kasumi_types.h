@@ -55,7 +55,7 @@ struct kasumi_entry {
 	bool source_path_valid;
 	bool source_nofollow_stat_valid;
 	bool source_nofollow_path_valid;
-	unsigned char type;
+	u32 rule_flags;
 	u32 src_hash;
 	struct hlist_node node;
 	struct hlist_node target_node;
@@ -66,6 +66,7 @@ struct kasumi_hide_entry {
 	char *path;
 	u32 path_hash;
 	bool storage_managed;
+	u32 rule_flags;
 	struct hlist_node node;
 	struct rcu_head rcu;
 };
@@ -83,6 +84,7 @@ struct kasumi_xattr_sb_entry {
 };
 
 struct kasumi_merge_entry {
+	u32 rule_flags;
 	char *src;
 	char *target;
 	char *resolved_src;

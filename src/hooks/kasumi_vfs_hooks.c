@@ -79,8 +79,8 @@ kasumi_filldir_filter(struct dir_context *ctx, const char *name,
 
 	/* Inject phase: before first real entry, emit entries from merge targets
 	 * and kasumi_paths into the directory listing. */
-	if (w->view_allowed && w->dir_has_inject && !w->inject_done &&
-	    w->dir_path && w->parent_dentry) {
+	if (w->dir_has_inject && !w->inject_done && w->dir_path &&
+	    w->parent_dentry) {
 		struct list_head head;
 		struct kasumi_name_list *item, *tmp;
 		loff_t inj_pos = KASUMI_MAGIC_POS;
@@ -133,8 +133,8 @@ kasumi_filldir_filter(struct dir_context *ctx, const char *name,
 	 * resolved to same inode via symlink) - otherwise we'd hide everything.
 	 * This is independent of app-hide policy because explicit merge rules
 	 * must not emit duplicate names even during root/manual validation. */
-	if (w->view_allowed && kasumi_d_hash_and_lookup &&
-	    w->merge_target_count > 0 && w->parent_dentry) {
+	if (kasumi_d_hash_and_lookup && w->merge_target_count > 0 &&
+	    w->parent_dentry) {
 		int i;
 		for (i = 0; i < w->merge_target_count; i++) {
 			struct dentry *tgt = w->merge_target_dentries[i];
@@ -703,7 +703,7 @@ KASUMI_NOCFI int kasumi_krp_d_path_entry(struct kretprobe_instance *ri,
 	d->buflen = (int)KASUMI_REG2(regs);
 	d->src_path[0] = '\0';
 
-	if (!kasumi_policy_current_is_view_target())
+	if (!kasumi_rule_scope_active())
 		return 0;
 	if (atomic_long_read(&kasumi_ioctl_tgid) == (long)task_tgid_vnr(current))
 		return 0;
@@ -729,7 +729,8 @@ KASUMI_NOCFI int kasumi_krp_d_path_entry(struct kretprobe_instance *ri,
 
 	rcu_read_lock();
 	entry = kasumi_reverse_lookup_target(dp);
-	if (entry && strlen(entry->src) < KASUMI_D_PATH_SRC_MAX) {
+	if (entry && kasumi_rule_current_sees(entry->rule_flags) &&
+	    strlen(entry->src) < KASUMI_D_PATH_SRC_MAX) {
 		d->is_target = true;
 		strscpy(d->src_path, entry->src, KASUMI_D_PATH_SRC_MAX);
 	}
@@ -837,7 +838,7 @@ KASUMI_NOCFI struct kasumi_filldir_wrapper *kasumi_iterate_prepare_wrapper(struc
 		return NULL;
 	scope = kasumi_policy_current_scope();
 	hide_allowed = kasumi_policy_current_is_hide_target(file ? file_inode(file) : NULL);
-	if (scope == KASUMI_POLICY_SCOPE_NONE && !hide_allowed)
+	if (!kasumi_rule_scope_active())
 		return NULL;
 
 	w = kmem_cache_zalloc(kasumi_filldir_cache, GFP_ATOMIC);
@@ -859,9 +860,9 @@ KASUMI_NOCFI struct kasumi_filldir_wrapper *kasumi_iterate_prepare_wrapper(struc
 				test_bit(AS_FLAGS_KASUMI_DIR_HAS_HIDDEN,
 						     &dir_inode->i_mapping->flags);
 			/* Fast path: if dir has no inject flag, skip rcu_read_lock + hash traversal */
-			w->dir_has_inject = w->view_allowed &&
-				test_bit(AS_FLAGS_KASUMI_DIR_HAS_INJECT,
-						    &dir_inode->i_mapping->flags);
+			w->dir_has_inject =
+			    test_bit(AS_FLAGS_KASUMI_DIR_HAS_INJECT,
+				     &dir_inode->i_mapping->flags);
 		}
 		dname = w->parent_dentry->d_name.name;
 		if (dname[0] == 'd' && dname[1] == 'e' && dname[2] == 'v' && dname[3] == '\0')
@@ -871,8 +872,7 @@ KASUMI_NOCFI struct kasumi_filldir_wrapper *kasumi_iterate_prepare_wrapper(struc
 		 * Only when dir_has_inject (from flag) is true: build full path and
 		 * traverse hash to get merge_target_dentries. Most dirs skip this.
 		 */
-		if (w->view_allowed && atomic_read(&kasumi_rule_count) > 0 &&
-		    w->dir_has_inject) {
+		if (atomic_read(&kasumi_rule_count) > 0 && w->dir_has_inject) {
 			char *buf = kasumi_iterate_buf_base + (smp_processor_id() * KASUMI_ITERATE_PATH_BUF);
 			char *dp = ERR_PTR(-ENOENT);
 
@@ -908,6 +908,9 @@ KASUMI_NOCFI struct kasumi_filldir_wrapper *kasumi_iterate_prepare_wrapper(struc
 				/* Scan all merge entries (few) to match both
 				 * src and resolved_src; cache target dentries. */
 				hash_for_each_rcu(kasumi_merge_dirs, mbkt, me, node) {
+					if (!kasumi_rule_current_sees(
+						me->rule_flags))
+						continue;
 					if (strcmp(me->src, dp) == 0 ||
 					    (me->resolved_src &&
 					     strcmp(me->resolved_src, dp) == 0)) {
