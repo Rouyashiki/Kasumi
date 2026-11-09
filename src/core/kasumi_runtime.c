@@ -978,11 +978,68 @@ KASUMI_NOCFI void kasumi_clear_inode_flags_for_path(const char *path_str,
 
 	if (!path_str || !kasumi_kern_path)
 		return;
-	if (kasumi_kern_path(path_str, LOOKUP_FOLLOW, &p) != 0)
+	if (kasumi_kern_path(path_str,
+			     bit == AS_FLAGS_KASUMI_HIDE ? 0 : LOOKUP_FOLLOW,
+			     &p) != 0)
 		return;
 	if (p.dentry && d_inode(p.dentry) && d_inode(p.dentry)->i_mapping)
 		clear_bit(bit, &d_inode(p.dentry)->i_mapping->flags);
 	kasumi_path_put(&p);
+}
+
+bool kasumi_store_upsert(struct kasumi_entry *replacement)
+{
+	struct kasumi_entry *entry;
+	u32 hash = replacement->src_hash;
+	bool changed = true, found = false;
+	unsigned long h1, h2;
+
+	mutex_lock(&kasumi_config_mutex);
+	hlist_for_each_entry(
+	    entry, &kasumi_paths[hash_min(hash, KASUMI_HASH_BITS)], node)
+	{
+		if (entry->src_hash != hash ||
+		    strcmp(entry->src, replacement->src))
+			continue;
+		changed = strcmp(entry->target, replacement->target) != 0;
+		hlist_add_head_rcu(
+		    &replacement->node,
+		    &kasumi_paths[hash_min(hash, KASUMI_HASH_BITS)]);
+		hlist_add_head_rcu(
+		    &replacement->target_node,
+		    &kasumi_targets[hash_min(
+			full_name_hash(NULL, replacement->target,
+				       strlen(replacement->target)),
+			KASUMI_HASH_BITS)]);
+		hlist_del_rcu(&entry->node);
+		hlist_del_rcu(&entry->target_node);
+		if (changed)
+			kasumi_clear_inode_flags_for_path(
+			    entry->target, AS_FLAGS_KASUMI_SPOOF_KSTAT);
+		call_rcu(&entry->rcu, kasumi_entry_free_rcu);
+		found = true;
+		break;
+	}
+	if (!found) {
+		hlist_add_head_rcu(
+		    &replacement->node,
+		    &kasumi_paths[hash_min(hash, KASUMI_HASH_BITS)]);
+		hlist_add_head_rcu(
+		    &replacement->target_node,
+		    &kasumi_targets[hash_min(
+			full_name_hash(NULL, replacement->target,
+				       strlen(replacement->target)),
+			KASUMI_HASH_BITS)]);
+		h1 = jhash(replacement->src, strlen(replacement->src), 0) &
+		     (KASUMI_BLOOM_SIZE - 1);
+		h2 = jhash(replacement->src, strlen(replacement->src), 1) &
+		     (KASUMI_BLOOM_SIZE - 1);
+		set_bit(h1, kasumi_path_bloom);
+		set_bit(h2, kasumi_path_bloom);
+		atomic_inc(&kasumi_rule_count);
+	}
+	mutex_unlock(&kasumi_config_mutex);
+	return changed;
 }
 
 void kasumi_cleanup_locked(void)
