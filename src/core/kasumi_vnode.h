@@ -3,7 +3,7 @@
  * Kasumi - real-superblock virtual inode backend (Tier 3 data plane).
  *
  * A virtual node is a real inode allocated on the *visible path's own*
- * superblock (new_inode(dir->i_sb)), so dentry and inode share a superblock
+ * superblock (kasumi_sop_new_inode(dir->i_sb)), so dentry and inode share a superblock
  * (no cross-sb pairing) and stat naturally reports the containing filesystem's
  * device.  Identity (ino) is projected from Kasumi's captured rule via the
  * scheme-A vnode identity, so stat/fstat/maps/ls all agree.  Real I/O, mmap,
@@ -21,6 +21,8 @@
 
 #include <linux/capability.h>
 #include <linux/fs.h>
+#include <linux/list.h>
+#include <linux/mutex.h>
 #include <linux/path.h>
 #include <linux/types.h>
 
@@ -35,21 +37,29 @@
  * reference to the data backing this visible node; it is {NULL,NULL} for a
  * pure virtual directory that only exists to host injected children.
  */
+struct kasumi_inode_identity;
+struct kasumi_io_notify;
+
 struct kasumi_vnode_info {
+	struct hlist_node cache_node;
+	struct inode *inode;
+	struct kasumi_inode_identity *identity;
+	struct kasumi_identity_domain *identity_domain;
+	struct kasumi_identity_hold *identity_hold;
+	struct kasumi_io_notify *io_notify;
+	struct mutex io_notify_lock;
+	struct mutex label_lock;
 	struct path source;
 	unsigned long v_ino;
 	u8 flags;
-	/* Visible path of a KASUMI_VNODE_F_VIRTUAL_DIR (source-less) node, used to
-	 * resolve its children against the rule table.  NULL for backed nodes. */
+	/* Immutable path anchor for a configured directory. Mutable descendants
+	 * derive their paths from the current dentry ancestry. */
 	char *visible_path;
-	/* File capabilities parsed from the source at create time, replayed onto
-	 * the exec-path get_vfs_caps_from_disk read (which lands on this synthetic
-	 * inode that has no on-disk security.capability).  @has_caps gates it. */
-	bool has_caps;
+	/* Odd while a child rename commits its backing and visible dentries. */
+	atomic_t rename_seq;
 	/* Held in the per-superblock reclaim owner until destroy_inode releases
-	 * this actual new_inode() object. */
+	 * this generic inode object. */
 	bool sop_vnode_ref;
-	struct cpu_vfs_cap_data caps;
 	/* For a char/blk/fifo source wrapper (KASUMI_VNODE_F_SPECIAL): the vnode
 	 * inode is minted S_IFREG so it passes may_open_dev on a nodev visible
 	 * mount and uses our special fops, but stat must present the source's real
@@ -60,14 +70,12 @@ struct kasumi_vnode_info {
 
 /*
  * Allocate a virtual inode on @sb (the visible parent's superblock) backed by
- * @source (may be NULL for a virtual directory).  @v_ino is the stable visible
- * inode number (kasumi_vnode_source_ino()|bit63) and @flags carry the node
- * kind.  Returns NULL on failure; on success the inode owns a pinned copy of
+ * @source. The inode holds a source identity reference and @flags carry the
+ * node kind. Returns ERR_PTR on failure. On success it owns a pinned copy of
  * @source and must be released through the ordinary iput()/eviction path with
  * the superblock destroy_inode shim calling kasumi_vnode_free_info().
  */
-struct inode *kasumi_vnode_new(struct super_block *sb, const struct path *source,
-			       unsigned long v_ino, umode_t mode, u8 flags);
+struct inode *kasumi_vnode_new(struct super_block *sb, const struct path *source, umode_t mode, u8 flags);
 
 /*
  * Allocate a pure-virtual directory inode (KASUMI_VNODE_F_VIRTUAL_DIR) on @sb
@@ -78,21 +86,38 @@ struct inode *kasumi_vnode_new(struct super_block *sb, const struct path *source
  * plausible security.selinux.  Owns a copy of @visible_path, released through
  * kasumi_vnode_free_info.
  */
+/* Set once before a newly allocated directory inode is published. */
+int kasumi_vnode_set_visible_path(struct inode *inode, const char *path);
+/* Caller frees the snapshot; NULL means no configured ancestor. */
+char *kasumi_vnode_visible_path(struct dentry *dentry);
+
 struct inode *kasumi_vnode_new_virtual(struct super_block *sb,
 				       const char *visible_path,
-				       unsigned long v_ino,
 				       struct inode *label_donor);
 
 /* True if @inode is a Kasumi virtual node (its i_op is one of our tables). */
 bool kasumi_vnode_is_ours(const struct inode *inode);
+/* Call after all vnode files and module entry points have drained. */
+void kasumi_vnode_fops_exit(void);
+/* Keep native handle encoders guarded until every vnode has been reclaimed. */
+int kasumi_vnode_handle_init(void);
+void kasumi_vnode_handle_exit(void);
+/* Initialize before publishing vnode fops; exit after all file refs drain. */
+int kasumi_vnode_aio_init(void);
+bool kasumi_vnode_aio_busy(void);
+void kasumi_vnode_aio_exit(void);
 
-/*
- * If @dentry resolves to a Kasumi vnode that stashed file capabilities from its
- * source, copy them into @out and return true.  Atomic-context safe (pure field
- * reads): used from the get_vfs_caps_from_disk kretprobe on the exec path.
- */
-bool kasumi_vnode_peek_caps(const struct dentry *dentry,
-			    struct cpu_vfs_cap_data *out);
+/* Return 1 with a pinned source, 0 for an unbacked inode, or a negative error. */
+int kasumi_vnode_source_path(const struct dentry *dentry, struct path *source);
+int kasumi_vnode_refresh_label(const struct dentry *dentry);
+
+/* Consumes one opened exec file reference and its native deny-write token. */
+struct file *kasumi_vnode_exec_file(struct file *file);
+struct file *kasumi_vnode_exec_open(struct file *file);
+
+/* Read current source capabilities in sleepable context. */
+int kasumi_vnode_read_caps(const struct dentry *dentry,
+			   struct cpu_vfs_cap_data *out, bool *handled);
 
 /*
  * Release the i_private state of a virtual inode.  Called from the hijacked

@@ -16,15 +16,52 @@
 #include <linux/fs.h>
 #include <linux/hashtable.h>
 #include <linux/list.h>
+#include <linux/llist.h>
 #include <linux/mutex.h>
 #include <linux/path.h>
 #include <linux/rcupdate.h>
+#include <linux/rbtree.h>
 #include <linux/spinlock.h>
 #include <linux/xarray.h>
+#include <linux/workqueue.h>
 
 #include "kasumi_base.h"
 
+struct kasumi_live_rule;
+
+struct kasumi_rule_lifetime {
+	u64 first_generation;
+	u64 last_generation;
+	struct list_head batch_node;
+	struct list_head live_node;
+	struct kasumi_live_rule *live_rule;
+	u64 batch_generation;
+	u64 previous_last_generation;
+	unsigned int batch_store;
+};
+
+struct kasumi_rule_index {
+	struct rb_node node;
+	struct kasumi_rule_lifetime *life;
+	const char *path;
+	bool hide;
+	bool linked;
+};
+
+struct kasumi_inode_identity;
+
+struct kasumi_rule_source_index {
+	struct hlist_node node;
+	const struct kasumi_entry *entry;
+	const struct inode *inode;
+	const struct kasumi_inode_identity *identity;
+};
+
 struct kasumi_entry {
+	u64 sequence;
+	struct kasumi_rule_lifetime life;
+	struct kasumi_rule_index index;
+	struct llist_node free_node;
 	char *src;
 	char *target;
 	char *source_canonical;
@@ -32,6 +69,10 @@ struct kasumi_entry {
 	struct path source_path;
 	struct path source_nofollow_path;
 	struct inode *source_inode;
+	struct kasumi_inode_identity *source_identity;
+	struct kasumi_identity_domain *source_domain;
+	struct kasumi_inode_identity *nofollow_identity;
+	struct kasumi_rule_source_index source_index[2];
 	struct kstat source_stat;
 	struct kstat source_nofollow_stat;
 	struct kstat visible_stat;
@@ -53,6 +94,8 @@ struct kasumi_entry {
 	 * type/size/allocation fields are refreshed dynamically. */
 	bool preserve_visible_metadata;
 	bool source_path_valid;
+	bool source_iop_owned;
+	bool nofollow_iop_owned;
 	bool source_nofollow_stat_valid;
 	bool source_nofollow_path_valid;
 	u32 rule_flags;
@@ -63,6 +106,9 @@ struct kasumi_entry {
 };
 
 struct kasumi_hide_entry {
+	u64 sequence;
+	struct kasumi_rule_lifetime life;
+	struct kasumi_rule_index index;
 	char *path;
 	u32 path_hash;
 	bool storage_managed;
@@ -72,6 +118,7 @@ struct kasumi_hide_entry {
 };
 
 struct kasumi_inject_entry {
+	struct kasumi_rule_lifetime life;
 	char *dir;
 	struct inode *fop_inode;
 	struct hlist_node node;
@@ -79,12 +126,18 @@ struct kasumi_inject_entry {
 };
 
 struct kasumi_xattr_sb_entry {
+	struct kasumi_rule_lifetime life;
 	struct super_block *sb;
+	struct work_struct free_work;
 	struct hlist_node node;
 	struct rcu_head rcu;
 };
 
 struct kasumi_merge_entry {
+	struct kasumi_rule_lifetime life;
+	struct kasumi_rule_index index;
+	struct kasumi_rule_index alias_index;
+	struct llist_node free_node;
 	u32 rule_flags;
 	char *src;
 	char *target;

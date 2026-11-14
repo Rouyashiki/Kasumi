@@ -16,10 +16,16 @@
 #include "kasumi_runtime.h"
 
 struct kasumi_spoof_kstat_entry {
+	struct llist_node free_node;
+	struct path captured_path;
+	bool iop_owned;
+	struct kasumi_rule_lifetime life;
+	u32 fields;
 	char *target_pathname;
 	u32 path_hash;
 	unsigned long target_ino;
 	unsigned long target_dev;
+	bool target_dev_valid;
 	unsigned long spoofed_ino;
 	unsigned long spoofed_dev;
 	unsigned int spoofed_nlink;
@@ -32,19 +38,9 @@ struct kasumi_spoof_kstat_entry {
 	long spoofed_ctime_nsec;
 	unsigned long spoofed_blksize;
 	unsigned long long spoofed_blocks;
-	int is_static;
 	struct hlist_node path_node;
 	struct hlist_node ino_node;
 	struct rcu_head rcu;
-};
-
-struct kasumi_maps_rule_entry {
-	struct list_head list;
-	unsigned long target_ino;
-	unsigned long target_dev;
-	unsigned long spoofed_ino;
-	unsigned long spoofed_dev;
-	char spoofed_pathname[KSM_MAX_LEN_PATHNAME];
 };
 
 extern struct hlist_head kasumi_paths[1 << KASUMI_HASH_BITS];
@@ -55,15 +51,17 @@ extern struct hlist_head kasumi_xattr_sbs[1 << KASUMI_HASH_BITS];
 extern struct hlist_head kasumi_merge_dirs[1 << KASUMI_HASH_BITS];
 extern struct hlist_head kasumi_spoof_kstat_path[1 << KASUMI_HASH_BITS];
 extern struct hlist_head kasumi_spoof_kstat_ino[1 << KASUMI_HASH_BITS];
-extern struct list_head kasumi_maps_rules;
 
 extern struct mutex kasumi_config_mutex;
-extern struct mutex kasumi_maps_mutex;
 
 extern unsigned long kasumi_path_bloom[BITS_TO_LONGS(KASUMI_BLOOM_SIZE)];
 extern unsigned long kasumi_hide_bloom[BITS_TO_LONGS(KASUMI_BLOOM_SIZE)];
 
 struct kasumi_spoof_kstat_entry *kasumi_spoof_kstat_lookup_by_path(const char *path_str);
+int kasumi_spoof_kstat_upsert(struct kasumi_spoof_kstat *rule);
+int kasumi_spoof_kstat_validate(const struct kasumi_transaction_kstat_rule *rule);
+int kasumi_spoof_kstat_stage(const struct kasumi_transaction_kstat_rule *rule,
+			   u64 *resolved_ino);
 struct kasumi_spoof_kstat_entry *kasumi_spoof_kstat_lookup_by_ino(unsigned long ino,
 								unsigned long dev);
 
@@ -72,8 +70,9 @@ int kasumi_forget_hide_rule(const char *path, bool unbind);
 void kasumi_mark_inode_hidden(struct inode *inode);
 bool kasumi_is_inode_hidden_bit(struct inode *inode);
 void kasumi_clear_inode_flags_for_path(const char *path_str, unsigned int bit);
-bool kasumi_store_upsert(struct kasumi_entry *entry);
+int kasumi_store_upsert(struct kasumi_entry *entry);
 void kasumi_cleanup_locked(void);
+void kasumi_store_drain(void);
 
 int kasumi_entry_capture_source(struct kasumi_entry *entry,
 				const char *source_path);

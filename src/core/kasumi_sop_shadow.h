@@ -18,7 +18,8 @@ bool kasumi_sop_shadow_available(void);
 int kasumi_sop_shadow_register_dh(struct super_block *sb);
 void kasumi_sop_shadow_unregister_dh(struct super_block *sb);
 
-/* Actual new_inode() objects, distinct from rule/source capture counts. */
+/* Generic inode objects on the visible superblock. The caller owns a vnode ref. */
+struct inode *kasumi_sop_new_inode(struct super_block *sb);
 bool kasumi_sop_vnode_get(struct super_block *sb);
 void kasumi_sop_vnode_put(struct super_block *sb);
 

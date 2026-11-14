@@ -1,4 +1,5 @@
 #include <linux/refcount.h>
+#include <linux/llist.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
@@ -10,6 +11,9 @@
 
 struct managed_hide_rule {
 	struct list_head list;
+	struct list_head pending;
+	struct llist_node dirty_node;
+	atomic_t dirty_queued;
 	refcount_t refs;
 	u64 id;
 	u64 generation;
@@ -29,6 +33,9 @@ struct managed_hide_rule {
  * drops mutation for path lookup and never acquires lifecycle admission. */
 DEFINE_MUTEX(kasumi_mutation_mutex);
 static LIST_HEAD(hide_rules);
+static LIST_HEAD(hide_pending);
+static LLIST_HEAD(hide_dirty);
+static u64 hide_queued_seq;
 static struct kasumi_hide_events hide_events;
 static struct workqueue_struct *hide_queue;
 static struct task_struct *hide_resolver;
@@ -51,18 +58,51 @@ static void hide_rule_put(struct managed_hide_rule *rule)
 static void hide_workfn(struct work_struct *work);
 static DECLARE_WORK(hide_work, hide_workfn);
 
-static void hide_event(void *data)
+static void hide_schedule(void)
 {
 	unsigned long flags;
 
-	atomic64_inc(&hide_event_seq);
 	spin_lock_irqsave(&hide_schedule_lock, flags);
-	if (!hide_stopping && READ_ONCE(kasumi_enabled)) {
+	if (!hide_stopping && kasumi_config_enabled()) {
 		atomic_inc(&hide_jobs);
 		if (!queue_work(hide_queue, &hide_work))
 			atomic_dec(&hide_jobs);
 	}
 	spin_unlock_irqrestore(&hide_schedule_lock, flags);
+}
+
+static void hide_event(void *data)
+{
+	(void)data;
+	atomic64_inc(&hide_event_seq);
+	hide_schedule();
+}
+
+static void hide_rule_event(void *data)
+{
+	struct managed_hide_rule *rule = data;
+
+	if (READ_ONCE(rule->deleting) || READ_ONCE(hide_stopping) ||
+	    !kasumi_config_enabled())
+		return;
+	if (!atomic_cmpxchg(&rule->dirty_queued, 0, 1)) {
+		refcount_inc(&rule->refs);
+		llist_add(&rule->dirty_node, &hide_dirty);
+	}
+	hide_schedule();
+}
+
+static void hide_drain_dirty(bool enqueue)
+{
+	struct managed_hide_rule *rule, *next;
+	struct llist_node *head = llist_del_all(&hide_dirty);
+
+	llist_for_each_entry_safe(rule, next, head, dirty_node) {
+		atomic_set(&rule->dirty_queued, 0);
+		if (enqueue && !rule->deleting && list_empty(&rule->pending))
+			list_add_tail(&rule->pending, &hide_pending);
+		hide_rule_put(rule);
+	}
 }
 
 bool kasumi_hide_rules_resolving(void)
@@ -72,43 +112,39 @@ bool kasumi_hide_rules_resolving(void)
 
 static void hide_workfn(struct work_struct *work)
 {
-	struct managed_hide_rule *rule, *selected;
+	struct managed_hide_rule *rule;
 	struct kasumi_hide_binding *candidate;
 	struct kasumi_hide_watch *watches;
 	struct path parent;
-	u64 sequence, generation, cursor = 0;
+	u64 sequence = 0, generation;
 	bool resolved, same;
 	int ret;
 
 	for (;;) {
 		mutex_lock(&kasumi_mutation_mutex);
-		if (hide_stopping || !READ_ONCE(kasumi_enabled))
+		if (hide_stopping || !kasumi_config_enabled())
 			goto done;
-		sequence = atomic64_read(&hide_event_seq);
-		ret = kasumi_hide_events_ack(&hide_events);
-		selected = NULL;
-		list_for_each_entry (rule, &hide_rules, list) {
-			if (ret < 0) {
-				rule->error = ret;
-				rule->state = KSM_USER_HIDE_ERROR;
-			}
-			if (rule->processed != sequence && rule->id > cursor &&
-			    !selected)
-				selected = rule;
-		}
-		if (!selected && cursor && ret >= 0) {
-			cursor = 0;
-			list_for_each_entry (rule, &hide_rules, list) {
-				if (rule->processed != sequence) {
-					selected = rule;
-					break;
+		if (list_empty(&hide_pending)) {
+			hide_drain_dirty(true);
+			sequence = atomic64_read(&hide_event_seq);
+			ret = kasumi_hide_events_ack(&hide_events);
+			if (ret || sequence != hide_queued_seq) {
+				list_for_each_entry(rule, &hide_rules, list) {
+					if (ret < 0) {
+						rule->error = ret;
+						rule->state = KSM_USER_HIDE_ERROR;
+					} else if (list_empty(&rule->pending)) {
+						list_add_tail(&rule->pending, &hide_pending);
+					}
 				}
+				hide_queued_seq = sequence;
 			}
+			if (ret < 0 || list_empty(&hide_pending))
+				goto done;
 		}
-		if (ret < 0 || !selected)
-			goto done;
-		rule = selected;
-		cursor = rule->id;
+		rule = list_first_entry(&hide_pending, struct managed_hide_rule,
+					pending);
+		list_del_init(&rule->pending);
 		refcount_inc(&rule->refs);
 		generation = rule->generation;
 		rule->state = KSM_USER_HIDE_BINDING;
@@ -118,13 +154,14 @@ static void hide_workfn(struct work_struct *work)
 		watches = NULL;
 		WRITE_ONCE(hide_resolver, current);
 		ret = kasumi_hide_events_watch_path(
-		    &hide_events, rule->parent, rule->name, &parent, &watches);
+		    &hide_events, rule->parent, rule->name, &parent, &watches,
+		    hide_rule_event, rule);
 		WRITE_ONCE(hide_resolver, NULL);
 
 		mutex_lock(&kasumi_mutation_mutex);
 		if (hide_stopping || rule->deleting ||
 		    rule->generation != generation ||
-		    !READ_ONCE(kasumi_enabled))
+		    !kasumi_config_enabled())
 			goto next;
 		candidate = NULL;
 		resolved = !ret;
@@ -138,8 +175,7 @@ static void hide_workfn(struct work_struct *work)
 		if (resolved && !same)
 			ret = kasumi_dirhijack_hide_get(
 			    &parent, rule->name, rule->flags, &candidate);
-		if (candidate || ret == -ENOENT || ret == -ENOTDIR ||
-		    (resolved && !same)) {
+		if (candidate || ret == -ENOENT || ret == -ENOTDIR) {
 			kasumi_dirhijack_hide_put(rule->binding);
 			rule->binding = candidate;
 		}
@@ -157,6 +193,11 @@ static void hide_workfn(struct work_struct *work)
 		cond_resched();
 	}
 done:
+	while (!list_empty(&hide_pending)) {
+		rule = list_first_entry(&hide_pending, struct managed_hide_rule,
+					pending);
+		list_del_init(&rule->pending);
+	}
 	mutex_unlock(&kasumi_mutation_mutex);
 	atomic_dec(&hide_jobs);
 }
@@ -198,8 +239,9 @@ void kasumi_hide_rules_changed(void)
 
 static void hide_remove(struct managed_hide_rule *rule)
 {
-	rule->deleting = true;
+	WRITE_ONCE(rule->deleting, true);
 	rule->generation++;
+	list_del_init(&rule->pending);
 	list_del(&rule->list);
 	kasumi_hide_events_unwatch(rule->watches);
 	kasumi_dirhijack_hide_put(rule->binding);
@@ -214,6 +256,7 @@ void kasumi_hide_rules_clear(void)
 	atomic64_inc(&hide_event_seq);
 	list_for_each_entry_safe (rule, tmp, &hide_rules, list)
 		hide_remove(rule);
+	hide_drain_dirty(false);
 }
 
 static void hide_stop_new(void)
@@ -266,7 +309,7 @@ static void hide_snapshot(struct kasumi_user_hide_arg *arg,
 	arg->flags = rule->flags;
 	arg->rule_id = rule->id;
 	arg->generation = rule->generation;
-	arg->management = READ_ONCE(kasumi_enabled) ? KSM_USER_HIDE_LIVE
+	arg->management = kasumi_config_enabled() ? KSM_USER_HIDE_LIVE
 						    : KSM_USER_HIDE_SUSPENDED;
 	arg->binding = rule->state;
 	arg->error = rule->error;
@@ -381,6 +424,8 @@ long kasumi_hide_rules_ioctl(unsigned int cmd, void __user *user)
 		match->name = match->path + (slash - arg->path) + 1;
 		match->id = ++hide_next_id;
 		refcount_set(&match->refs, 1);
+		INIT_LIST_HEAD(&match->pending);
+		atomic_set(&match->dirty_queued, 0);
 		list_add_tail(&match->list, &hide_rules);
 	}
 	if (match->flags != arg->flags) {
@@ -391,7 +436,7 @@ long kasumi_hide_rules_ioctl(unsigned int cmd, void __user *user)
 retry:
 	match->generation++;
 	match->processed = 0;
-	hide_event(NULL);
+	hide_rule_event(match);
 reply:
 	hide_snapshot(arg, match);
 	if (copy_to_user(user, arg, sizeof(*arg)))

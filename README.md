@@ -11,11 +11,45 @@ It provides path redirection, hiding, directory merge/injection, and scoped proc
 - Repository type: LKM, not an in-tree kernel patch set
 - Implementation: `src/`
 - Userspace ABI: `src/include/kasumi_uapi.h`
-- Protocol: `KSM_PROTOCOL_VERSION = 18`
+- Protocol: `KSM_PROTOCOL_VERSION = 19`
+
+Userspace and kernel must both use API 19. Older and newer protocols are unsupported; there is no downgrade path. All ioctls retain the fixed `'S'` magic. Clients check `KSM_IOC_GET_VERSION` before issuing operations and stop on a protocol mismatch.
 - Path view: VFS lookup/vnode based; there is no syscall-table dispatcher or `sys_enter` redirect engine
 - Control entry: root-only `reboot` GET_FD command, followed by fd-based ioctls
 
-## API 18 conflict guard
+## API 19 transactions
+
+API 19 publishes path rules, settings, standalone policy, maps rules and kstat rules under one generation. A fresh control file owns each transaction. Keep that file open through staging, commit and recovery.
+
+1. Query `KSM_IOC_GET_CAPABILITIES` and the optional feature mask.
+2. Call `KSM_IOC_BEGIN_TRANSACTION` with the expected generation. Zero captures the current generation. A generation change makes commit return `EAGAIN`. Abort the staged transaction, or close its file and open a fresh control file, before beginning again and restaging.
+3. Stage path operations with `KSM_IOC_STAGE_TRANSACTION` and configuration with `KSM_IOC_STAGE_CONFIGURATION`. Each successful configuration stage replaces the previously staged configuration as a whole.
+4. Commit with `KSM_IOC_COMMIT_TRANSACTION`. Inspect `state`, `error`, `generation` and `failed_operation`.
+5. If copying the commit result failed, query the same file with `KSM_IOC_QUERY_TRANSACTION`. Repeating a successful commit is idempotent. Closing the file releases its staged state.
+
+A transaction accepts at most 65,536 path operations, 65,536 maps rules and 65,536 kstat rules, with a shared limit of 64 MiB of staged data and up to 256 path operations per stage call. A failed stage preserves earlier staged operations. A failed commit preserves the published generation. `KSM_TX_REPLACE_PATH_RULES` replaces the path and xattr sets. `KSM_TX_REPLACE_XATTR_RULES` replaces only the xattr set. A configuration-only transaction preserves path rules. The embedded YukiSU provider owns UID policy and rejects standalone policy fields.
+
+Maps and kstat rules have explicit `fields` masks. Selected zero values are meaningful. `KSM_MATCH_ANY_DEVICE` selects wildcard matching, while an exact device value of zero remains valid. Device values use the kernel encoding `(major << 20) | minor`. Timestamp seconds and signed sizes use their 64-bit two's-complement representation. `KSM_TX_CONFIG_RESET_POLICY` restores the unconfigured standalone policy state.
+
+`KSM_CAP_LIVE_RULES` reports source and merge-directory monitoring. Updates retain the captured root, working directory and credentials. Source replacement publishes a new generation while existing open files retain their source reference. `GET_HOOKS` reports the live rule count and last refresh error. Prepare failures retain the previous published view.
+
+Notification support is reported independently through `KSM_CAP_SOURCE_INOTIFY`, `KSM_CAP_MULTISOURCE_INOTIFY`, `KSM_CAP_SOURCE_FANOTIFY_INODE` and `KSM_CAP_MULTISOURCE_FANOTIFY`. Availability depends on the running kernel configuration and successful installation of the corresponding native entry adapter. Multi-source watches cover aliases, MERGE and virtual directories using a captured observer scope. Inotify retains its native watch descriptor, queue, rename cookies and watch-removal events. Fanotify retains native event queues and permission decisions, including pending decisions during teardown. Multi-source FID watches support native visible directories with `FAN_REPORT_FID` and masks without directory-entry events, subject to native filesystem ID and exportfs checks. Synthetic anchors, DIR_FID/NAME reporting and directory-entry FID events return `EOPNOTSUPP`. Composite `FAN_MARK_ADD | FAN_MARK_EVICTABLE` also returns `EOPNOTSUPP` because subscription snapshots retain object references. Mount and filesystem marks use their native visible-mount scope.
+
+Source ACCESS/MODIFY notifications follow the native producer's result, timing and PID. The relay installs one native mark at the vnode's first successful open. Kernels with `FSNOTIFY_MARK_FLAG_NO_IREF` cache it until inode reclamation. Older kernels retire their inode-pinning mark at the last file release. Removing the last pathname preserves the relay for held files while retiring native user watches. Queued I/O retains the necessary file references through completion. Rule changes refresh multi-source subscriptions after materialization has finished, while failed transactions preserve existing subscriptions.
+
+The mount projection uses the observed task's own namespace and root. Its cache contains metadata, with kernel references confined to active calls and native proc-file lifetimes. Ordinary applications use the selected policy scope and isolated UIDs use `SPOOF`.
+
+Source-backed directory children support rename through a pre-lock syscall adapter. Renames and exchanges retain live visible dentries, so cwd and open directory paths follow the new names. Crossing between projected and native directories returns `EXDEV`. Exact single-file aliases return `EXDEV` because their configured path binding requires an explicit rule update. Source-less directories remain read-only. Older mmap ABIs retain their native source-file identity. Rule-owned identity domains preserve observed child inode numbers across dentry reclamation and hardlink or casefold aliases. Native unlink eviction and superblock shutdown retire the corresponding identities, while held references preserve their previous numbers. Module-generated inode numbers are unique within the live Kasumi registry, while the visible filesystem may also allocate native inode numbers in the same numeric range.
+
+`KSM_CAP_SOURCE_XATTR` reports complete source get/list/set/remove xattr delegation. Operations enforce visible-object and source-object permissions, source mount idmaps and write references. Native VFS also enforces a read-only visible mount. Exec passes the source file to binfmt for write exclusion and capability handling, with executable identity following that source file. SELinux context copying can fail after native create has created the source object.
+
+`KSM_CAP_SOURCE_LOCKS` and `KSM_CAP_SOURCE_LEASES` advertise source-backed POSIX/OFD/flock and lease ownership. Direct source access and aliases share the source lock domain. Owner, signal and fasync operations use the source file, including close-race cleanup.
+
+File-operation variants follow the source's read, write and iterator capabilities and a version-specific flag whitelist. NOWAIT preserves source freeze contention as `EAGAIN`. Buffered asynchronous reads use the io_uring worker fallback. Explicit `IOCB_WAITQ` requests return `EAGAIN`, and unsupported metadata requests return `EOPNOTSUPP`.
+
+Kagami and the integrated ksud configuration accept nonempty `kasumi_kstat_rules`. Store 64-bit fields as decimal strings for exact JSON round trips. Selected zero values and explicit device wildcard masks retain their API 19 meaning. Enabling a nonempty kstat configuration requires the API 19 kstat capability.
+
+## Conflict guard
 
 Mount hiding retains the ordinary behavior. Command 38 and capability bit 12
 are reserved; mount-namespace link projection and mode selection are removed.
@@ -47,7 +81,7 @@ failure and the kernel log identifies the conflicting target.
 - Preserve visible path, inode/device identity, SELinux context, and exec-time file capabilities where supported
 - Forward file and directory mutations to directory-backed sources
 - Apply policy by detected root provider or explicit allow/deny UID lists
-- Present scoped `/proc/<pid>/maps`, `mountinfo`, `mounts`, mount namespace links, and statfs/statx mount identity
+- Present scoped `/proc/<pid>/maps`, `smaps`, `mountinfo`, `mounts`, `mountstats`, `fdinfo`, and statfs/statx mount identity
 - Configure kstat, maps, mount-hide, statfs, and overlay-xattr features
 
 Socket sources are not supported. Source-less virtual directories are read-only.
@@ -147,7 +181,7 @@ int features = 0;
 
 if (ioctl(fd, KSM_IOC_GET_VERSION, &version) < 0 ||
     version != KSM_PROTOCOL_VERSION) {
-    /* incompatible userspace/kernel ABI */
+    return -1; /* incompatible userspace/kernel ABI */
 }
 
 if (ioctl(fd, KSM_IOC_GET_FEATURES, &features) < 0) {
@@ -155,46 +189,23 @@ if (ioctl(fd, KSM_IOC_GET_FEATURES, &features) < 0) {
 }
 ```
 
-Use the feature mask before requesting optional behavior, especially `KSM_FEATURE_QUIESCE` and `KSM_FEATURE_MOUNT_HIDE_AGGRESSIVE`.
+Use the feature mask before requesting optional behavior, especially `KSM_FEATURE_QUIESCE` and `KSM_FEATURE_MOUNT_HIDE`.
 
-### 3. Configure and enable
+### 3. API 19 transactional configuration
 
-The recommended controller sequence is:
+1. Obtain a dedicated control FD and require an exact `KSM_PROTOCOL_VERSION` match.
+2. Query `KSM_IOC_GET_CAPABILITIES` and check the required capabilities and transaction limits.
+3. Call `KSM_IOC_BEGIN_TRANSACTION` on that FD.
+4. Stage rules and configuration with `KSM_IOC_STAGE_TRANSACTION` and `KSM_IOC_STAGE_CONFIGURATION`.
+5. Publish with `KSM_IOC_COMMIT_TRANSACTION`. On failure, preserve the previous state and finish recovery with query/abort or by closing the FD.
 
-1. Obtain the fd and verify `KSM_PROTOCOL_VERSION`.
-2. Query `KSM_IOC_GET_FEATURES`.
-3. Call `KSM_IOC_SET_ENABLED` with `0` before replacing policy. Policy mutations return `-EBUSY` while Kasumi is enabled.
-4. Replace policy with `KSM_IOC_REPLACE_POLICY`.
-5. Add path/merge/hide rules and configure optional features.
-6. Call `KSM_IOC_SET_ENABLED` with `1`.
-
-A minimal redirect looks like this:
-
-```c
-int disabled = 0;
-int enabled = 1;
-struct kasumi_policy_replace_arg policy = {
-    .version = KSM_POLICY_API_VERSION,
-    .size = sizeof(policy),
-    .owner = KSM_POLICY_OWNER_AUTO,
-};
-struct kasumi_syscall_arg rule = {
-    .src = "/system/etc/example.conf",              /* visible path */
-    .target = "/data/adb/modules/example/system/etc/example.conf",
-    .type = 0,
-};
-
-ioctl(fd, KSM_IOC_SET_ENABLED, &disabled);
-ioctl(fd, KSM_IOC_REPLACE_POLICY, &policy);
-ioctl(fd, KSM_IOC_ADD_RULE, &rule);
-ioctl(fd, KSM_IOC_SET_ENABLED, &enabled);
-```
+The individual rule commands below remain part of API 19. Complete configuration updates and rebuilds use the transaction sequence above.
 
 For `struct kasumi_syscall_arg`:
 
 - `src` is the visible path controlled by Kasumi.
 - `target` is the real backing source path.
-- `type` is a legacy/fallback dirent type; controllers normally pass `0` because Kasumi captures the source type.
+- `type` carries `KSM_RULE_FLAGS_MASK`. Zero uses the configured policy.
 
 ### Rule ioctls
 
@@ -227,7 +238,6 @@ To read a consistent snapshot, call `KSM_IOC_GET_POLICY`, then `KSM_IOC_GET_POLI
 | --- | --- |
 | `KSM_IOC_GET_FEATURES` | `int *` feature mask |
 | `KSM_IOC_GET_HOOKS` | `struct kasumi_syscall_list_arg *` output buffer |
-| `KSM_IOC_SET_MOUNT_HIDE_MODE` | `int *` containing `KSM_MOUNT_HIDE_MODE_NORMAL` or `KSM_MOUNT_HIDE_MODE_AGGRESSIVE` |
 | `KSM_IOC_SET_MOUNT_HIDE` | `struct kasumi_mount_hide_arg *` |
 | `KSM_IOC_ADD_MAPS_RULE` / `KSM_IOC_CLEAR_MAPS_RULES` | `struct kasumi_maps_rule *` / no argument |
 | `KSM_IOC_SET_MAPS_SPOOF` | `struct kasumi_maps_spoof_arg *` |
@@ -236,28 +246,7 @@ To read a consistent snapshot, call `KSM_IOC_GET_POLICY`, then `KSM_IOC_GET_POLI
 | `KSM_IOC_HIDE_OVERLAY_XATTRS` | `struct kasumi_syscall_arg *`, using `src` |
 | `KSM_IOC_SELINUX_FIX` | `int *` enable value |
 
-SELinux Guard uses Android's file-open hook to install a shared `.write`
-proxy on newly opened writable proc `attr/current` files. Feature bit 10
-requires this proxy; enabling an unavailable guard returns `EOPNOTSUPP`.
-When enabled, SPOOF callers receive bounded padding for zero-length inputs
-or a nofault first-byte peek of NUL or LF. A failed peek or nonzero offset
-bypasses padding. The original writer is called once with unchanged
-arguments; padding runs only after it returns `EINVAL`. Successful writes
-and other errors receive no padding. All permission checks and return
-values are retained. The selinuxfs `access` and `context` hooks remain
-passthrough. Kasumi leaves `status` file operations untouched so SELinux
-Hide retains control of its `.open` callback lifetime.
-
-`kasumi_guard_pad_ns` defaults to 1000 ns, is capped at 2000 ns, and accepts
-zero to disable padding. Each wait has a monotonic deadline and a 256-loop
-limit, and stops on a rescheduling request without disabling interrupts or
-preemption. `GET_HOOKS` shows the effective budget, placement, and `spins`, counting
-waits that executed at least one loop iteration.
-
-This is experimental compensation: the budget is not a wall-time bound,
-user memory can change between the peek and original copy. FDs opened before
-hook registration are not covered; later switch changes apply to proxied
-FDs. Built-in context matching and fabricated SELinux results remain removed.
+SELinux Guard (`KSM_IOC_SELINUX_FIX`) provides bounded timing compensation for proc `attr/current` writes in the SPOOF scope. The original write runs first; only parse-skipping inputs that return `EINVAL` receive padding. The default budget is 100 ns, capped at 200 ns and 256 spin iterations, with an early exit when rescheduling is needed. Native SELinux permissions and return values are preserved. `KSM_IOC_GET_HOOKS` reports availability, budget and spin count; enabling returns `EOPNOTSUPP` only when the write proxy is unavailable.
 
 For ioctls whose argument struct contains `err`, check both the `ioctl()` return value and `arg.err`.
 
@@ -284,9 +273,9 @@ ioctl(fd, KSM_IOC_PREPARE_UNLOAD, &q);
 
 ## Rule policy bypass
 
-API 18 uses bit 0 of `kasumi_syscall_arg.type` as `KSM_RULE_BYPASS_POLICY`:
+API 19 uses bit 0 of `kasumi_syscall_arg.type` as `KSM_RULE_BYPASS_POLICY`:
 `type = 0` preserves the existing policy, and `type = 1` explicitly opts a rule
-into global visibility or hiding. API 17 and existing controllers initialize
+into global visibility or hiding. Controllers initialize
 this field to zero. The structure size and ioctl encodings do not change.
 This field is a flag mask, not a directory-entry file type.
 
@@ -333,7 +322,7 @@ the numeric flags after ADD, MERGE, and HIDE records.
 
 ## Standard Userspace Controller
 
-[Kagami](https://github.com/Rouyashiki/Kagami) is the only standard userspace controller implementation for the current Kasumi ABI. Use its Kasumi client and matching UAPI definitions as the reference when integrating API 18.
+[Kagami](https://github.com/Rouyashiki/Kagami) is the only standard userspace controller implementation for the current Kasumi ABI. Use its Kasumi client and matching UAPI definitions as the reference when integrating API 19.
 
 ## Troubleshooting
 

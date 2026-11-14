@@ -11,11 +11,45 @@ English version: [README.md](./README.md)
 - 仓库形态：LKM，不是 in-tree 内核补丁
 - 内核实现：`src/`
 - 用户态 ABI：`src/include/kasumi_uapi.h`
-- 当前协议：`KSM_PROTOCOL_VERSION = 18`
+- 当前协议：`KSM_PROTOCOL_VERSION = 19`
+
+用户态与内核必须严格匹配 API 19；不支持 API 18 或未来版本，也不提供降级路径。所有 ioctl 均沿用固定的 `'S'` magic；客户端通过 `KSM_IOC_GET_VERSION` 检查版本，不匹配时停止操作。
 - 路径视图：由 VFS lookup/vnode 提供，不再包含 syscall table dispatcher 或 `sys_enter` redirect 引擎
 - 控制入口：root-only `reboot` GET_FD 命令，后续操作全部通过 fd ioctl 完成
 
-## API 18 防冲突保护
+## API 19 事务
+
+API 19 通过一个 generation 发布路径规则、设置、独立版 policy、maps 与 kstat 规则。每个事务绑定独立打开的控制 file，staging、commit 和故障恢复都使用同一个 FD。
+
+1. 查询 `KSM_IOC_GET_CAPABILITIES` 与可选 feature mask。
+2. 调用 `KSM_IOC_BEGIN_TRANSACTION`，填写期望的 `expected_generation`，零表示捕获当前代际。commit 遇到代际变化会返回 `EAGAIN`，控制器需先 abort 暂存事务，或关闭其 file 并重新打开控制 file，再重新 begin 并暂存内容。
+3. 使用 `KSM_IOC_STAGE_TRANSACTION` 添加路径操作，使用 `KSM_IOC_STAGE_CONFIGURATION` 添加配置。每次成功的配置 stage 都会整体替换此前暂存的配置。
+4. 调用 `KSM_IOC_COMMIT_TRANSACTION`，检查 `state`、`error`、`generation` 与 `failed_operation`。
+5. commit 结果复制失败时，在同一 file 上调用 `KSM_IOC_QUERY_TRANSACTION` 恢复状态。成功 commit 可幂等重试，关闭 file 会释放暂存内容。
+
+单个事务的路径操作、maps 规则和 kstat 规则分别最多 65,536 个，共享 64 MiB 暂存数据上限，每次 stage 最多 256 个路径操作。stage 失败保留此前暂存的操作，commit 失败保留已发布 generation。`KSM_TX_REPLACE_PATH_RULES` 替换路径和 xattr 集合，`KSM_TX_REPLACE_XATTR_RULES` 仅替换 xattr 集合。仅配置事务保留路径规则。嵌入 YukiSU 的版本由现有 provider 管理 UID policy，拒绝独立版 policy 字段。
+
+maps 与 kstat 使用显式 `fields` 掩码，选中的零值具有实际含义。`KSM_MATCH_ANY_DEVICE` 表示设备通配，精确匹配允许设备值为零。设备值采用内核编码 `(major << 20) | minor`，有符号时间秒数和 size 采用 64 位补码表示。`KSM_TX_CONFIG_RESET_POLICY` 恢复独立版未配置 policy 状态。
+
+`KSM_CAP_LIVE_RULES` 表示支持源路径和 merge 目录监视。更新保留配置时的 root、工作目录与凭据。源文件替换会发布新 generation，旧 FD 继续持有原始源对象。`GET_HOOKS` 显示 live 规则数量和最后刷新错误，准备失败时保留上一代已发布视图。
+
+通知支持通过 `KSM_CAP_SOURCE_INOTIFY`、`KSM_CAP_MULTISOURCE_INOTIFY`、`KSM_CAP_SOURCE_FANOTIFY_INODE` 与 `KSM_CAP_MULTISOURCE_FANOTIFY` 分别报告，取决于运行内核的配置及对应原生入口适配器是否安装成功。多来源 watch 按捕获的 observer scope 覆盖别名、MERGE 和虚拟目录。inotify 保留原生 watch descriptor、队列、rename cookie 和 watch 移除事件。fanotify 保留原生事件队列与权限裁决，包括卸载期间尚在等待的裁决。多来源 FID watch 支持原生可见目录上的 `FAN_REPORT_FID`，要求 mask 不含目录项事件，并通过原生 fsid 和 exportfs 检查。synthetic anchor、DIR_FID/NAME 和目录项 FID 事件返回 `EOPNOTSUPP`。复合订阅的快照持有对象引用，因此 `FAN_MARK_ADD | FAN_MARK_EVICTABLE` 也返回 `EOPNOTSUPP`。mount 和 filesystem mark 使用原生可见挂载作用域。
+
+源 ACCESS/MODIFY 通知遵循原生 producer 的结果、时机和 PID。转发器在 vnode 首次成功打开时安装一个原生 mark。支持 `FSNOTIFY_MARK_FLAG_NO_IREF` 的内核将其缓存到 inode 回收，旧内核在最后一个 file 执行 release 时撤销持有 inode 强引用的 mark。删除最后一个路径时，转发器继续服务仍打开的文件，同时按原生语义撤销用户 watch。queued I/O 持有完成所需的 file 引用。规则更新在 materialization 完成后刷新多来源订阅，事务失败时保留已有订阅。
+
+mount 投影使用被观察进程自己的 namespace 与 root。共享缓存保存 metadata，内核引用由活跃调用和原生 proc FD 生命周期持有。普通应用使用选定的 policy scope，isolated UID 使用 `SPOOF`。
+
+源目录中的普通子项通过原生加锁前的 syscall adapter 支持 rename。重命名及交换会保留可见 dentry，使 cwd 与已打开目录的路径跟随新名字。投影目录与原生目录之间的移动返回 `EXDEV`。精确单文件别名返回 `EXDEV`，其配置路径绑定需要显式更新规则。无后端源的虚拟目录保持只读。旧 mmap ABI 沿用原生 source-file identity。规则持有的 identity domain 使已观察子项在 dentry 回收、硬链接及 casefold 别名之间保持 inode 编号。源对象 unlink 后的 eviction 与 superblock shutdown 撤销对应身份，已持有的引用继续保留旧编号。Kasumi 分配的 inode 编号在活跃 registry 内唯一，可见文件系统也可能在同一数值区间分配原生 inode。
+
+`KSM_CAP_SOURCE_XATTR` 表示源对象 get/list/set/remove xattr 委托全部可用。操作遵循可见对象和源对象的权限检查、源挂载 idmap 与写引用。可见挂载的只读限制由原生 VFS 检查。exec 将真实源 file 交给 binfmt，以保持写入互斥和源能力读取，其 executable identity 随源 file。native create 成功后的 SELinux context 复制仍可能失败。
+
+`KSM_CAP_SOURCE_LOCKS` 与 `KSM_CAP_SOURCE_LEASES` 表示支持源对象的 POSIX/OFD/flock 和 lease 所有权。直接访问源路径与别名共享源锁域。owner、signal 和 fasync 操作作用于源 file，并处理加锁与关闭 FD 的竞态清理。
+
+file_operations 变体按源对象的 read、write、iterator 能力与内核版本对应的 flags 白名单选择。NOWAIT 在源文件系统冻结竞争时返回 `EAGAIN`。buffered 异步读采用 io_uring worker 回退，显式 `IOCB_WAITQ` 请求返回 `EAGAIN`，尚未支持的 metadata 请求返回 `EOPNOTSUPP`。
+
+Kagami 与集成 ksud 配置支持非空 `kasumi_kstat_rules`。64 位字段使用十进制字符串保存，以保证 JSON 往返精度。选中的零值和显式设备通配掩码遵循 API 19 语义。启用非空 kstat 配置需要 API 19 的 kstat 能力。
+
+## 防冲突保护
 
 挂载隐藏仅保留普通行为，命令 38 和能力位 12 保留，不再提供命名空间链接伪装或模式选择。
 独立版原有的策略、卸载握手和实例监视命令保持 ABI 不变。
@@ -42,7 +76,7 @@ GET 不清除事件；ACK 仅清除不晚于用户确认快照最大序号的事
 - 在支持的场景中保持可见路径、inode/dev 身份、SELinux context 与 exec file capabilities
 - 将文件属性修改及目录 mutation 写穿到目录型真实源
 - 按自动检测的 root provider 或显式 allow/deny UID 列表应用策略
-- 按作用域生成 `/proc/<pid>/maps`、`mountinfo`、`mounts`、挂载命名空间链接及 statfs/statx mount 身份
+- 按作用域生成 `/proc/<pid>/maps`、`smaps`、`mountinfo`、`mounts`、`mountstats`、`fdinfo` 及 statfs/statx mount 身份
 - 配置 kstat、maps、mount hide、statfs 与 overlay xattr 功能
 
 不支持 socket 源；无真实源的纯虚拟目录只读。
@@ -142,7 +176,7 @@ int features = 0;
 
 if (ioctl(fd, KSM_IOC_GET_VERSION, &version) < 0 ||
     version != KSM_PROTOCOL_VERSION) {
-    /* 用户态与内核 ABI 不兼容 */
+    return -1; /* 用户态与内核 ABI 不兼容 */
 }
 
 if (ioctl(fd, KSM_IOC_GET_FEATURES, &features) < 0) {
@@ -150,46 +184,23 @@ if (ioctl(fd, KSM_IOC_GET_FEATURES, &features) < 0) {
 }
 ```
 
-请求可选能力前必须检查 feature mask，尤其是 `KSM_FEATURE_QUIESCE` 与 `KSM_FEATURE_MOUNT_HIDE_AGGRESSIVE`。
+请求可选能力前必须检查 feature mask，尤其是 `KSM_FEATURE_QUIESCE` 与 `KSM_FEATURE_MOUNT_HIDE`。
 
-### 3. 配置并启用
+### 3. API 19 事务配置
 
-推荐的控制器调用顺序：
+1. 获取独立控制 FD，确认协议严格等于 `KSM_PROTOCOL_VERSION`。
+2. 查询 `KSM_IOC_GET_CAPABILITIES`，验证所需能力及事务容量。
+3. 在同一个 FD 上执行 `KSM_IOC_BEGIN_TRANSACTION`。
+4. 使用 `KSM_IOC_STAGE_TRANSACTION` 和 `KSM_IOC_STAGE_CONFIGURATION` 暂存规则及配置。
+5. 使用 `KSM_IOC_COMMIT_TRANSACTION` 发布；失败时保留原状态，并通过 query/abort 或关闭 FD 收尾。
 
-1. 获取 fd，并校验 `KSM_PROTOCOL_VERSION`。
-2. 查询 `KSM_IOC_GET_FEATURES`。
-3. 在替换 policy 前，通过 `KSM_IOC_SET_ENABLED` 传入 `0`。Kasumi enabled 时修改 policy 会返回 `-EBUSY`。
-4. 使用 `KSM_IOC_REPLACE_POLICY` 原子替换 policy。
-5. 添加路径/合并/隐藏规则，并配置可选功能。
-6. 通过 `KSM_IOC_SET_ENABLED` 传入 `1`。
-
-最小重定向示例：
-
-```c
-int disabled = 0;
-int enabled = 1;
-struct kasumi_policy_replace_arg policy = {
-    .version = KSM_POLICY_API_VERSION,
-    .size = sizeof(policy),
-    .owner = KSM_POLICY_OWNER_AUTO,
-};
-struct kasumi_syscall_arg rule = {
-    .src = "/system/etc/example.conf",              /* 可见路径 */
-    .target = "/data/adb/modules/example/system/etc/example.conf",
-    .type = 0,
-};
-
-ioctl(fd, KSM_IOC_SET_ENABLED, &disabled);
-ioctl(fd, KSM_IOC_REPLACE_POLICY, &policy);
-ioctl(fd, KSM_IOC_ADD_RULE, &rule);
-ioctl(fd, KSM_IOC_SET_ENABLED, &enabled);
-```
+下面列出的单项规则接口仍属于 API 19，完整配置与重建使用上述事务流程。
 
 `struct kasumi_syscall_arg` 字段含义：
 
 - `src`：由 Kasumi 控制的可见路径。
 - `target`：真实后端源路径。
-- `type`：历史/fallback dirent 类型；Kasumi 会捕获源类型，控制器通常传 `0`。
+- `type` 携带 `KSM_RULE_FLAGS_MASK`，零表示遵循已配置策略。
 
 ### 路径规则接口
 
@@ -222,7 +233,6 @@ ioctl 参数引用的字符串和 buffer 必须保持有效，直到该 ioctl �
 | --- | --- |
 | `KSM_IOC_GET_FEATURES` | `int *` feature mask |
 | `KSM_IOC_GET_HOOKS` | `struct kasumi_syscall_list_arg *` 输出 buffer |
-| `KSM_IOC_SET_MOUNT_HIDE_MODE` | 指向 `KSM_MOUNT_HIDE_MODE_NORMAL` 或 `KSM_MOUNT_HIDE_MODE_AGGRESSIVE` 的 `int *` |
 | `KSM_IOC_SET_MOUNT_HIDE` | `struct kasumi_mount_hide_arg *` |
 | `KSM_IOC_ADD_MAPS_RULE` / `KSM_IOC_CLEAR_MAPS_RULES` | `struct kasumi_maps_rule *` / 无参数 |
 | `KSM_IOC_SET_MAPS_SPOOF` | `struct kasumi_maps_spoof_arg *` |
@@ -231,24 +241,7 @@ ioctl 参数引用的字符串和 buffer 必须保持有效，直到该 ioctl �
 | `KSM_IOC_HIDE_OVERLAY_XATTRS` | `struct kasumi_syscall_arg *`，使用 `src` 字段 |
 | `KSM_IOC_SELINUX_FIX` | 指向 enable 值的 `int *` |
 
-SELinux Guard 通过 Android 文件打开 hook，为新打开的可写 proc
-`attr/current` 文件安装共享 `.write` 代理。能力位 10 要求该代理可用，
-不可用时开启返回 `EOPNOTSUPP`。开启后，仅对 SPOOF 调用者的零长度输入，
-或无缺页预读首字节为 NUL、LF 的输入补时；预读失败和偏移非零时直接
-交给原函数。原写入函数以原始参数调用一次，仅在它返回 `EINVAL` 后
-补时，成功写入和其他错误不补时；权限检查和返回结果由它负责。
-selinuxfs 的 `access`、`context` 入口继续透传。Kasumi 不替换 `status`
-的文件操作表，其 `.open` 回调生命周期由 SELinux Hide 自身管理。
-
-`kasumi_guard_pad_ns` 默认 1000 ns，有效预算最高 2000 ns，零表示关闭。
-每次等待使用单调时钟截止点，最多循环 256 次，遇到调度请求退出，保留
-中断和抢占。`GET_HOOKS` 显示有效预算、位置和
-`spins`（至少执行过一次循环的等待次数）。
-
-本功能属于实验性补偿：预算不是墙钟耗时上限；两次用户缓冲区读取之间
-内容可能改变。
-hook 注册前已打开的 FD 不覆盖，已代理 FD 会读取最新开关状态。
-内置 context 匹配和伪造 SELinux 返回结果仍保持移除。
+SELinux Guard（`KSM_IOC_SELINUX_FIX`）对 SPOOF 作用域内的 proc `attr/current` 写入进行有界时序补偿。原生写入先执行；只有跳过 context 解析且返回 `EINVAL` 的输入才追加补偿。默认预算为 100 ns，上限为 200 ns 和 256 次自旋，需要调度时提前退出。保留原生 SELinux 权限检查与返回值。`KSM_IOC_GET_HOOKS` 报告可用性、预算和自旋次数；仅在写入代理不可用时，开启请求返回 `EOPNOTSUPP`。
 
 对于参数结构体中带 `err` 字段的 ioctl，应同时检查 `ioctl()` 返回值与 `arg.err`。
 
@@ -275,7 +268,7 @@ ioctl(fd, KSM_IOC_PREPARE_UNLOAD, &q);
 
 ## 标准用户态控制器
 
-[Kagami](https://github.com/Rouyashiki/Kagami) 是当前 Kasumi ABI 唯一的标准用户态控制器实现。接入 API 18 时，应以其中的 Kasumi client 与配套 UAPI 定义作为参考。
+[Kagami](https://github.com/Rouyashiki/Kagami) 是当前 Kasumi ABI 唯一的标准用户态控制器实现。接入 API 19 时，应以其中的 Kasumi client 与配套 UAPI 定义作为参考。
 
 ## 快速排障
 
@@ -299,9 +292,9 @@ ioctl(fd, KSM_IOC_PREPARE_UNLOAD, &q);
 
 ## 规则绕过策略
 
-API 18 将 `kasumi_syscall_arg.type` 的 bit 0 定义为
+API 19 将 `kasumi_syscall_arg.type` 的 bit 0 定义为
 `KSM_RULE_BYPASS_POLICY`：`type = 0` 保持原有策略，显式传 `type = 1`
-才让规则的显隐全局生效。API 17 和已有控制器默认将该字段置零，旧规则
+才让规则的显隐全局生效。控制器默认将该字段置零，普通规则
 不会自动变成全局规则。结构大小和 ioctl 编码不变；该字段表示标志位，
 不再用作目录项文件类型。
 

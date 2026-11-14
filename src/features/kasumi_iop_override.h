@@ -19,18 +19,14 @@ void kasumi_iop_override_exit(void);
 unsigned int kasumi_iop_override_active(void);
 bool kasumi_iop_override_quiesced(void);
 
-/*
- * Install shadow inode_operations on `inode`. Idempotent: safe to call on an
- * already-installed inode (becomes a no-op).
- *
- * After successful install, AS_FLAGS_KASUMI_IOP_INSTALLED is set on
- * inode->i_mapping->flags so the slow kprobe path can short-circuit.
- *
- * Returns 0 on success or already-installed; negative errno on failure.
- */
+/* Rule owners retain their source path until the matching put. */
+int kasumi_iop_get(const struct path *path);
+void kasumi_iop_put(const struct path *path);
+void kasumi_iop_override_drain(void);
+void kasumi_iop_retire_batch_begin(void);
+void kasumi_iop_retire_batch_end(void);
+const struct inode_operations *kasumi_iop_original_iops(const struct inode *inode);
 int kasumi_iop_install(struct inode *inode);
-int kasumi_iop_mark_spoof(struct inode *inode);
-void kasumi_iop_cleanup_inode(struct inode *inode);
 
 /*
  * Apply kstat spoofing in place. Extracted from the original vfs_getattr

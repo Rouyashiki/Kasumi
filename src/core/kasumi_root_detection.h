@@ -52,6 +52,7 @@ extern bool kasumi_apatch_policy_lifetime_stable;
 void kasumi_root_detect(void);
 bool kasumi_root_allows_spoofing(void);
 bool kasumi_refresh_apatch_policy(void);
+void kasumi_invalidate_apatch_cache(void);
 bool kasumi_probe_apatch_policy(unsigned long *addr, bool *lifetime_stable);
 
 #endif

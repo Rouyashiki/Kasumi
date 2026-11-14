@@ -17,16 +17,21 @@
 #include "kasumi_sop_shadow.h"
 #include "kasumi_dirhijack.h"
 #include "kasumi_runtime.h"
+#include "kasumi_vnode.h"
+#include "kasumi_identity.h"
 
 #include <linux/fs.h>
 #include <linux/hashtable.h>
+#include <linux/kprobes.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/rcupdate.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/srcu.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
+#include <linux/version.h>
 
 #define KASUMI_SOP_HASH_BITS 8
 
@@ -42,6 +47,7 @@ struct kasumi_sop_meta {
 	bool sb_active_held;
 	bool module_pin_held;
 	struct hlist_node node;
+	struct list_head retire_node;
 };
 
 static DEFINE_HASHTABLE(kasumi_sop_table, KASUMI_SOP_HASH_BITS);
@@ -55,6 +61,203 @@ static atomic_t kasumi_sop_vnodes = ATOMIC_INIT(0);
 static DECLARE_WAIT_QUEUE_HEAD(kasumi_sop_wait);
 static bool kasumi_sop_ready;
 static bool kasumi_sop_reap_work_enabled;
+static struct kmem_cache *kasumi_inode_cache;
+static void (*kasumi_inode_sb_list_add)(struct inode *inode);
+static void (*kasumi_inode_rcu_free)(struct rcu_head *head);
+
+struct kasumi_sop_reader_guard {
+	struct hlist_node node;
+	struct task_struct *task;
+	int index;
+};
+
+static DEFINE_HASHTABLE(kasumi_sop_reader_guards, 6);
+static spinlock_t kasumi_sop_reader_locks[HASH_SIZE(kasumi_sop_reader_guards)] = {
+	[0 ... HASH_SIZE(kasumi_sop_reader_guards) - 1] =
+		__SPIN_LOCK_UNLOCKED(kasumi_sop_reader_locks),
+};
+static DEFINE_MUTEX(kasumi_sop_reader_manage_lock);
+DEFINE_STATIC_SRCU(kasumi_sop_readers);
+static atomic_t kasumi_sop_reader_active = ATOMIC_INIT(0);
+static bool kasumi_sop_readers_stopping = true;
+static unsigned int kasumi_sop_reader_registered;
+static struct inode *(*kasumi_sop_native_alloc)(struct super_block *sb);
+static void (*kasumi_sop_native_evict)(struct inode *inode);
+static void (*kasumi_sop_native_destroy)(struct inode *inode);
+
+static bool kasumi_sop_reader_guarded(void)
+{
+	spinlock_t *lock = &kasumi_sop_reader_locks[
+		hash_min((unsigned long)current, HASH_BITS(kasumi_sop_reader_guards))];
+	struct kasumi_sop_reader_guard *guard;
+	unsigned long flags;
+	bool found = false;
+
+	spin_lock_irqsave(lock, flags);
+	hash_for_each_possible(kasumi_sop_reader_guards, guard, node,
+			       (unsigned long)current) {
+		if (guard->task == current) {
+			found = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(lock, flags);
+	return found;
+}
+
+static void kasumi_sop_reader_enter(struct kasumi_sop_reader_guard *guard)
+{
+	spinlock_t *lock = &kasumi_sop_reader_locks[
+		hash_min((unsigned long)current, HASH_BITS(kasumi_sop_reader_guards))];
+	unsigned long flags;
+
+	guard->index = srcu_read_lock(&kasumi_sop_readers);
+	guard->task = current;
+	spin_lock_irqsave(lock, flags);
+	hash_add(kasumi_sop_reader_guards, &guard->node, (unsigned long)current);
+	spin_unlock_irqrestore(lock, flags);
+}
+
+static void kasumi_sop_reader_leave(struct kasumi_sop_reader_guard *guard)
+{
+	spinlock_t *lock = &kasumi_sop_reader_locks[
+		hash_min((unsigned long)guard->task, HASH_BITS(kasumi_sop_reader_guards))];
+	unsigned long flags;
+
+	spin_lock_irqsave(lock, flags);
+	hash_del(&guard->node);
+	spin_unlock_irqrestore(lock, flags);
+	srcu_read_unlock(&kasumi_sop_readers, guard->index);
+	if (atomic_dec_and_test(&kasumi_sop_reader_active))
+		wake_up_all(&kasumi_sop_wait);
+}
+
+static KASUMI_NOCFI struct inode *kasumi_sop_alloc_entry(struct super_block *sb)
+{
+	struct kasumi_sop_reader_guard guard;
+	struct inode *inode;
+
+	kasumi_sop_reader_enter(&guard);
+	inode = kasumi_sop_native_alloc(sb);
+	kasumi_sop_reader_leave(&guard);
+	return inode;
+}
+
+static KASUMI_NOCFI void kasumi_sop_evict_entry(struct inode *inode)
+{
+	struct kasumi_sop_reader_guard guard;
+
+	kasumi_sop_reader_enter(&guard);
+	kasumi_sop_native_evict(inode);
+	kasumi_sop_reader_leave(&guard);
+}
+
+static KASUMI_NOCFI void kasumi_sop_destroy_entry(struct inode *inode)
+{
+	struct kasumi_sop_reader_guard guard;
+
+	kasumi_sop_reader_enter(&guard);
+	kasumi_sop_native_destroy(inode);
+	kasumi_sop_reader_leave(&guard);
+}
+
+static int kasumi_sop_alloc_pre(struct kprobe *probe, struct pt_regs *regs);
+static int kasumi_sop_evict_pre(struct kprobe *probe, struct pt_regs *regs);
+static int kasumi_sop_shutdown_pre(struct kprobe *probe, struct pt_regs *regs);
+static int kasumi_sop_destroy_pre(struct kprobe *probe, struct pt_regs *regs);
+
+static struct kprobe kasumi_sop_reader_probes[] = {
+	{ .symbol_name = "alloc_inode", .pre_handler = kasumi_sop_alloc_pre },
+	{ .symbol_name = "evict", .pre_handler = kasumi_sop_evict_pre },
+	{ .symbol_name = "__destroy_inode", .pre_handler = kasumi_sop_destroy_pre },
+	{ .symbol_name = "generic_shutdown_super", .pre_handler = kasumi_sop_shutdown_pre },
+};
+
+static int kasumi_sop_reader_pre(struct pt_regs *regs, unsigned long entry)
+{
+#ifdef CONFIG_ARM64
+	if (READ_ONCE(kasumi_sop_readers_stopping) || kasumi_sop_reader_guarded())
+		return 0;
+	atomic_inc(&kasumi_sop_reader_active);
+	instruction_pointer_set(regs, entry);
+	return 1;
+#else
+	return 0;
+#endif
+}
+
+static int kasumi_sop_alloc_pre(struct kprobe *probe, struct pt_regs *regs)
+{
+	return kasumi_sop_reader_pre(regs, (unsigned long)kasumi_sop_alloc_entry);
+}
+
+static int kasumi_sop_evict_pre(struct kprobe *probe, struct pt_regs *regs)
+{
+#ifdef CONFIG_ARM64
+	struct inode *inode = (struct inode *)regs->regs[0];
+
+	if (inode && !READ_ONCE(inode->i_nlink) && !kasumi_vnode_is_ours(inode))
+		kasumi_identity_source_evict(inode->i_sb->s_dev, inode->i_ino);
+#endif
+	return kasumi_sop_reader_pre(regs, (unsigned long)kasumi_sop_evict_entry);
+}
+
+static int kasumi_sop_shutdown_pre(struct kprobe *probe, struct pt_regs *regs)
+{
+#ifdef CONFIG_ARM64
+	struct super_block *sb = (struct super_block *)regs->regs[0];
+
+	if (sb)
+		kasumi_identity_source_unmount(sb->s_dev);
+#endif
+	return 0;
+}
+
+static int kasumi_sop_destroy_pre(struct kprobe *probe, struct pt_regs *regs)
+{
+	return kasumi_sop_reader_pre(regs, (unsigned long)kasumi_sop_destroy_entry);
+}
+
+static void kasumi_sop_readers_stop(void)
+{
+	mutex_lock(&kasumi_sop_reader_manage_lock);
+	if (kasumi_sop_readers_stopping && !kasumi_sop_reader_registered)
+		goto unlock;
+	WRITE_ONCE(kasumi_sop_readers_stopping, true);
+	while (kasumi_sop_reader_registered)
+		unregister_kprobe(&kasumi_sop_reader_probes[--kasumi_sop_reader_registered]);
+	wait_event(kasumi_sop_wait, !atomic_read(&kasumi_sop_reader_active));
+	kasumi_synchronize_rcu_tasks();
+unlock:
+	mutex_unlock(&kasumi_sop_reader_manage_lock);
+}
+
+static int kasumi_sop_readers_init(void)
+{
+	unsigned int i;
+	int ret;
+
+#ifndef CONFIG_ARM64
+	return -EOPNOTSUPP;
+#endif
+	kasumi_sop_native_alloc = (void *)kasumi_lookup_callable_quiet("alloc_inode");
+	kasumi_sop_native_evict = (void *)kasumi_lookup_callable_quiet("evict");
+	kasumi_sop_native_destroy = (void *)kasumi_lookup_callable_quiet("__destroy_inode");
+	if (!kasumi_sop_native_alloc || !kasumi_sop_native_evict || !kasumi_sop_native_destroy)
+		return -EOPNOTSUPP;
+	for (i = 0; i < ARRAY_SIZE(kasumi_sop_reader_probes); ++i) {
+		ret = register_kprobe(&kasumi_sop_reader_probes[i]);
+		if (ret) {
+			kasumi_sop_readers_stop();
+			return ret;
+		}
+		kasumi_sop_reader_registered++;
+	}
+	WRITE_ONCE(kasumi_sop_readers_stopping, false);
+	/* Pre-install callers can only retain the unmodified native vector. */
+	kasumi_synchronize_rcu_tasks();
+	return 0;
+}
 
 static void kasumi_sop_reap_workfn(struct work_struct *work);
 static DECLARE_WORK(kasumi_sop_reap_work, kasumi_sop_reap_workfn);
@@ -117,8 +320,44 @@ KASUMI_NOCFI static void kasumi_sop_destroy_inode(struct inode *inode)
 	const struct super_operations *orig;
 
 	m = kasumi_sop_callback_enter(inode ? inode->i_sb : NULL, &orig);
-	kasumi_dh_reclaim_destroy_inode(inode, orig);
+	if (kasumi_vnode_is_ours(inode)) {
+		kasumi_vnode_free_info(inode);
+		inode->free_inode = kasumi_free_inode_nonrcu_ptr;
+	} else {
+		if (orig && orig->destroy_inode) {
+			orig->destroy_inode(inode);
+			if (!orig->free_inode)
+				goto out;
+		}
+		inode->free_inode = orig ? orig->free_inode : NULL;
+	}
+	/* The kernel callback outlives this module and retains the native free ABI. */
+	call_rcu(&inode->i_rcu, kasumi_inode_rcu_free);
+out:
 	kasumi_sop_callback_exit(m);
+}
+
+struct inode *KASUMI_NOCFI kasumi_sop_new_inode(struct super_block *sb)
+{
+	struct inode *inode;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+	inode = alloc_inode_sb(sb, kasumi_inode_cache, GFP_KERNEL);
+#else
+	inode = kmem_cache_alloc(kasumi_inode_cache, GFP_KERNEL);
+#endif
+	if (!inode)
+		return NULL;
+	if (inode_init_always(sb, inode)) {
+		kasumi_free_inode_nonrcu_ptr(inode);
+		return NULL;
+	}
+	spin_lock(&inode->i_lock);
+	inode->i_state = 0;
+	INIT_LIST_HEAD(&inode->i_sb_list);
+	spin_unlock(&inode->i_lock);
+	kasumi_inode_sb_list_add(inode);
+	return inode;
 }
 
 KASUMI_NOCFI static void kasumi_sop_evict_inode(struct inode *inode)
@@ -219,23 +458,10 @@ int kasumi_sop_shadow_register_dh(struct super_block *sb)
 	spare->sb_active_held = true;
 	spare->module_pin_held = true;
 
-	if (!orig->destroy_inode && !orig->free_inode &&
-	    !kasumi_free_inode_nonrcu_ptr) {
-		ret = -EOPNOTSUPP;
-		goto out_s_umount;
-	}
-	/* Since Linux 5.10, VFS invokes ->destroy_inode synchronously and, when
-	 * ->free_inode is also present, records that callback in the inode before
-	 * queueing its own RCU callback.  Always use the synchronous stage for the
-	 * sleepable vnode cleanup, while leaving a filesystem's original deferred
-	 * container deallocator untouched.  For the generic-inode case, supplying
-	 * free_inode_nonrcu makes VFS queue the same generic free it would have used
-	 * without our newly-added destroy callback.  No module-owned callback is
-	 * ever stored in inode->free_inode.
-	 */
+	/* The synchronous trampoline queues the kernel's own RCU free callback.
+	 * A NULL free_inode prevents VFS from overwriting its per-inode choice. */
 	spare->shadow_sop.destroy_inode = kasumi_sop_destroy_inode;
-	if (!orig->destroy_inode && !orig->free_inode)
-		spare->shadow_sop.free_inode = kasumi_free_inode_nonrcu_ptr;
+	spare->shadow_sop.free_inode = NULL;
 	spare->shadow_sop.evict_inode = kasumi_sop_evict_inode;
 	spare->shadow_sop.drop_inode = kasumi_sop_drop_inode;
 
@@ -333,33 +559,11 @@ void kasumi_sop_vnode_put(struct super_block *sb)
 	wake_up_all(&kasumi_sop_wait);
 }
 
-static struct kasumi_sop_meta *kasumi_sop_take_reap_candidate(void)
-{
-	struct kasumi_sop_meta *m;
-	int bkt;
-
-	spin_lock(&kasumi_sop_lock);
-	hash_for_each(kasumi_sop_table, bkt, m, node) {
-		if (!m->restoring && !m->dh_clients &&
-		    !atomic_read(&m->vnode_live)) {
-			m->accepting_vnodes = false;
-			m->restoring = true;
-			spin_unlock(&kasumi_sop_lock);
-			return m;
-		}
-	}
-	spin_unlock(&kasumi_sop_lock);
-	return NULL;
-}
-
-static void kasumi_sop_reap_meta(struct kasumi_sop_meta *m)
+static void kasumi_sop_restore_meta(struct kasumi_sop_meta *m)
 {
 	struct super_block *sb = m->sb;
-	bool active_held;
-	bool module_held;
 
-	/* The retained s_active reference means shutdown cannot be in progress.
-	 * Take s_umount read-side anyway so the publication contract is explicit. */
+	/* The retained s_active reference excludes shutdown during restoration. */
 	down_read(&sb->s_umount);
 	spin_lock(&kasumi_sop_lock);
 	if (READ_ONCE(sb->s_op) == &m->shadow_sop)
@@ -368,39 +572,66 @@ static void kasumi_sop_reap_meta(struct kasumi_sop_meta *m)
 		WARN_ON_ONCE(READ_ONCE(sb->s_op) != m->orig_sop);
 	spin_unlock(&kasumi_sop_lock);
 	up_read(&sb->s_umount);
+}
 
-	/* A caller may have loaded shadow_sop just before the restore. */
+static void kasumi_sop_reap_batch(struct list_head *retiring)
+{
+	struct kasumi_sop_meta *m, *next;
+
+	list_for_each_entry(m, retiring, retire_node)
+		kasumi_sop_restore_meta(m);
+	/* Drain dispatches which loaded any of the withdrawn operation vectors. */
 	kasumi_synchronize_rcu_tasks();
-	wait_event(kasumi_sop_wait, !atomic_read(&m->callback_active));
+	synchronize_srcu(&kasumi_sop_readers);
+	/* Cover __destroy_inode returning to an inlined caller's cached vector. */
+	kasumi_synchronize_rcu_tasks();
+	list_for_each_entry(m, retiring, retire_node)
+		wait_event(kasumi_sop_wait, !atomic_read(&m->callback_active));
 	/* Cover callback epilogues after their active count reached zero. */
 	kasumi_synchronize_rcu_tasks();
 
 	spin_lock(&kasumi_sop_lock);
-	WARN_ON_ONCE(m->dh_clients || atomic_read(&m->vnode_live));
-	hash_del_rcu(&m->node);
-	atomic_dec(&kasumi_sop_live);
-	active_held = m->sb_active_held;
-	module_held = m->module_pin_held;
-	m->sb_active_held = false;
-	m->module_pin_held = false;
+	list_for_each_entry(m, retiring, retire_node) {
+		WARN_ON_ONCE(m->dh_clients || atomic_read(&m->vnode_live));
+		hash_del_rcu(&m->node);
+		atomic_dec(&kasumi_sop_live);
+	}
 	spin_unlock(&kasumi_sop_lock);
 	synchronize_rcu();
 
-	kasumi_log("sop_shadow: retired sb %p\n", sb);
-	kfree(m);
-	/* May run the original generic_shutdown_super() if userspace detached the
-	 * last mount while Kasumi held the extra active reference. */
-	kasumi_sop_drop_install_refs(sb, active_held, module_held);
+	list_for_each_entry_safe(m, next, retiring, retire_node) {
+		struct super_block *sb = m->sb;
+		bool active_held = m->sb_active_held;
+		bool module_held = m->module_pin_held;
+
+		list_del(&m->retire_node);
+		kasumi_log("sop_shadow: retired sb %p\n", sb);
+		kfree(m);
+		/* The last active reference may trigger the native shutdown path. */
+		kasumi_sop_drop_install_refs(sb, active_held, module_held);
+	}
 	wake_up_all(&kasumi_sop_wait);
 }
 
 void kasumi_sop_shadow_reap(void)
 {
 	struct kasumi_sop_meta *m;
+	LIST_HEAD(retiring);
+	int bucket;
 
 	mutex_lock(&kasumi_sop_manage_lock);
-	while ((m = kasumi_sop_take_reap_candidate()) != NULL)
-		kasumi_sop_reap_meta(m);
+	spin_lock(&kasumi_sop_lock);
+	hash_for_each(kasumi_sop_table, bucket, m, node) {
+		if (!m->restoring && !m->dh_clients &&
+		    !atomic_read(&m->vnode_live)) {
+			m->accepting_vnodes = false;
+			m->restoring = true;
+			list_add_tail(&m->retire_node, &retiring);
+		}
+	}
+	spin_unlock(&kasumi_sop_lock);
+	if (!list_empty(&retiring))
+		kasumi_sop_reap_batch(&retiring);
 	mutex_unlock(&kasumi_sop_manage_lock);
 }
 
@@ -412,10 +643,24 @@ static void kasumi_sop_reap_workfn(struct work_struct *work)
 
 int kasumi_sop_shadow_init(void)
 {
+	struct kmem_cache **cache;
+	int ret;
+
+	cache = (void *)kasumi_lookup_name_quiet("inode_cachep");
+	kasumi_inode_sb_list_add =
+		(void *)kasumi_lookup_callable_quiet("inode_sb_list_add");
+	kasumi_inode_rcu_free = (void *)kasumi_lookup_callable_quiet("i_callback");
+	if (!cache || !READ_ONCE(*cache) || !kasumi_inode_sb_list_add ||
+	    !kasumi_inode_rcu_free || !kasumi_free_inode_nonrcu_ptr)
+		return -EOPNOTSUPP;
+	kasumi_inode_cache = READ_ONCE(*cache);
 	hash_init(kasumi_sop_table);
 	atomic_set(&kasumi_sop_active, 0);
 	atomic_set(&kasumi_sop_live, 0);
 	atomic_set(&kasumi_sop_vnodes, 0);
+	ret = kasumi_sop_readers_init();
+	if (ret)
+		return ret;
 	WRITE_ONCE(kasumi_sop_reap_work_enabled, true);
 	WRITE_ONCE(kasumi_sop_ready, true);
 	pr_info("Kasumi: sop_shadow initialized\n");
@@ -464,6 +709,8 @@ bool kasumi_sop_shadow_quiesced(void)
 	 * so the result reflects every candidate visible before the flush.
 	 */
 	kasumi_sop_shadow_reap();
+	if (!atomic_read(&kasumi_sop_live))
+		kasumi_sop_readers_stop();
 	return !atomic_read(&kasumi_sop_live) &&
 	       !atomic_read(&kasumi_sop_active) &&
 	       !atomic_read(&kasumi_sop_vnodes);
@@ -484,6 +731,7 @@ void kasumi_sop_shadow_exit(void)
 	WARN_ON_ONCE(atomic_read(&kasumi_sop_live));
 	WARN_ON_ONCE(atomic_read(&kasumi_sop_active));
 	WARN_ON_ONCE(atomic_read(&kasumi_sop_vnodes));
+	kasumi_sop_readers_stop();
 	synchronize_rcu();
 	pr_info("Kasumi: sop_shadow exited\n");
 }

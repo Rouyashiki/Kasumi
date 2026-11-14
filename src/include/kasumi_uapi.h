@@ -29,7 +29,7 @@ typedef int32_t __s32;
 
 #define KSM_MAGIC1 0x4B534D31  // "KSM1"
 #define KSM_MAGIC2 0x524F4F54  // "ROOT"
-#define KSM_PROTOCOL_VERSION 18
+#define KSM_PROTOCOL_VERSION 19
 
 #define KSM_MAX_LEN_PATHNAME 256
 
@@ -64,7 +64,7 @@ typedef int32_t __s32;
 /* Only one syscall command: Get anonymous FD */
 #define KSM_CMD_GET_FD 0x48021
 
-/* API 18: zero preserves policy; bit 0 explicitly enables global rules.
+/* Zero preserves policy; bit 0 explicitly enables global rules.
  * Valid for ADD_RULE, ADD_MERGE_RULE and HIDE_RULE. Other bits are rejected. */
 #define KSM_RULE_BYPASS_POLICY (1U << 0)
 #define KSM_RULE_FLAGS_MASK KSM_RULE_BYPASS_POLICY
@@ -203,19 +203,19 @@ struct kasumi_spoof_kstat {
 /* Bit 2 remains reserved for the removed cmdline feature. */
 #define KSM_FEATURE_SELINUX_BYPASS (1 << 4)
 #define KSM_FEATURE_MERGE_DIR (1 << 5)
-#define KSM_FEATURE_MOUNT_HIDE (1 << 6) /* use shared proc mount snapshots for isolated readers */
+#define KSM_FEATURE_MOUNT_HIDE (1 << 6) /* project the observed mount namespace for selected readers */
 #define KSM_FEATURE_MAPS_SPOOF \
-    (1 << 7) /* spoof ino/dev/pathname in /proc/pid/maps (read buffer filter) */
+    (1 << 7) /* project ino/dev/pathname through native proc interfaces */
 #define KSM_FEATURE_STATFS_SPOOF \
     (1 << 8) /* spoof statfs f_type so direct matches resolved (INCONSISTENT_MOUNT) */
 #define KSM_FEATURE_FAKE_MOUNTINFO                                       \
-    (1 << 9) /* shared donor mount views with normalized propagation IDs \
-              */
-/* Bounded timing compensation for proc attr/current writes. */
+    (1 << 9) /* normalize propagation IDs in native mount views */
+/* Bounded post-write timing compensation for SELinux proc attributes. */
 #define KSM_FEATURE_SELINUX_FIX (1 << 10)
 #define KSM_FEATURE_FAKE_SELINUXFS KSM_FEATURE_SELINUX_FIX /* compatibility alias */
 #define KSM_FEATURE_QUIESCE (1 << 11) /* terminal pre-unload quiesce handshake */
 /* Bit 12 remains reserved for removed mount namespace link projection. */
+#define KSM_FEATURE_OVERLAY_XATTR_HIDE (1U << 13)
 
 #define KSM_FEATURE_MANAGED_HIDE (1 << 14)
 #define KSM_FEATURE_RULE_BYPASS (1 << 15)
@@ -261,8 +261,9 @@ struct kasumi_user_hide_arg {
 #define KSM_QUIESCE_BUSY_FILE_VIEW (1U << 4)
 #define KSM_QUIESCE_BUSY_CONTROL_FD (1U << 5)
 #define KSM_QUIESCE_BUSY_OTHER (1U << 6)
+#define KSM_QUIESCE_BUSY_FILE_LOCKS (1U << 7)
 
-/* Fixed-size API so an API 17 userspace can probe and poll quiesce safely.
+/* Fixed-size quiesce request for the matching protocol.
  * READY is a callback-safety barrier; delete_module remains the final liveness
  * oracle because dup/SCM_RIGHTS aliases can share the one reported control
  * file without creating another module reference.
@@ -422,5 +423,164 @@ struct kasumi_conflict_ack_arg {
 /* Diagnostics remain available while a loaded instance is quiescing. */
 #define KSM_IOC_GET_CONFLICTS _IOR(KSM_IOC_MAGIC, 46, struct kasumi_conflicts_arg)
 #define KSM_IOC_ACK_CONFLICTS _IOW(KSM_IOC_MAGIC, 47, struct kasumi_conflict_ack_arg)
+
+#define KSM_CAPABILITIES_VERSION 1
+#define KSM_CAP_ATOMIC_PATH_RULES (1ULL << 0)
+#define KSM_CAP_NATIVE_PROC_SEQ (1ULL << 1)
+#define KSM_CAP_PROCMAP_QUERY (1ULL << 2)
+#define KSM_TX_MAX_STAGE 256U
+#define KSM_TX_MAX_OPERATIONS 65536U
+#define KSM_TX_MAX_BYTES (64U * 1024U * 1024U)
+
+struct kasumi_capabilities {
+    __u32 size;
+    __u32 version;
+    __aligned_u64 capabilities;
+    __aligned_u64 generation;
+    __aligned_u64 operations;
+    __u32 max_stage;
+    __u32 max_operations;
+    __u32 max_bytes;
+    __u32 reserved[5];
+};
+
+#define KSM_TX_REPLACE_PATH_RULES (1U << 0)
+#define KSM_TX_REPLACE_XATTR_RULES (1U << 1)
+
+#define KSM_TX_STATE_STAGING 1U
+#define KSM_TX_STATE_COMMITTED 2U
+#define KSM_TX_STATE_ABORTED 3U
+#define KSM_TX_STATE_FAILED 4U
+
+struct kasumi_transaction {
+    __u32 size;
+    __u32 flags;
+    __aligned_u64 id;
+    __aligned_u64 expected_generation;
+    __aligned_u64 generation;
+    __u32 state;
+    __u32 operation_count;
+    __u32 failed_operation;
+    __s32 error;
+    __aligned_u64 reserved[2];
+};
+
+#define KSM_TX_REDIRECT 1U
+#define KSM_TX_MERGE 2U
+#define KSM_TX_HIDE 3U
+#define KSM_TX_DELETE 4U
+#define KSM_TX_HIDE_XATTRS 5U
+
+struct kasumi_transaction_rule {
+    __u32 operation;
+    __u32 flags;
+    __aligned_u64 visible_path;
+    __aligned_u64 source_path;
+};
+
+struct kasumi_transaction_stage {
+    __u32 size;
+    __u32 count;
+    __aligned_u64 id;
+    __aligned_u64 rules;
+};
+
+#define KSM_IOC_GET_CAPABILITIES _IOWR(KSM_IOC_MAGIC, 48, struct kasumi_capabilities)
+#define KSM_IOC_BEGIN_TRANSACTION _IOWR(KSM_IOC_MAGIC, 49, struct kasumi_transaction)
+#define KSM_IOC_STAGE_TRANSACTION _IOW(KSM_IOC_MAGIC, 50, struct kasumi_transaction_stage)
+#define KSM_IOC_COMMIT_TRANSACTION _IOWR(KSM_IOC_MAGIC, 51, struct kasumi_transaction)
+#define KSM_IOC_ABORT_TRANSACTION _IOWR(KSM_IOC_MAGIC, 52, struct kasumi_transaction)
+#define KSM_IOC_QUERY_TRANSACTION _IOWR(KSM_IOC_MAGIC, 53, struct kasumi_transaction)
+
+#define KSM_CAP_ATOMIC_SETTINGS (1ULL << 3)
+#define KSM_CAP_ATOMIC_POLICY (1ULL << 4)
+#define KSM_CAP_ATOMIC_MAPS (1ULL << 5)
+#define KSM_CAP_ATOMIC_KSTAT (1ULL << 6)
+#define KSM_CAP_LIVE_RULES (1ULL << 7)
+#define KSM_CAP_SOURCE_XATTR (1ULL << 8)
+#define KSM_CAP_SOURCE_LOCKS (1ULL << 9)
+#define KSM_CAP_SOURCE_LEASES (1ULL << 10)
+#define KSM_CAP_SOURCE_INOTIFY (1ULL << 11)
+#define KSM_CAP_MULTISOURCE_INOTIFY (1ULL << 12)
+#define KSM_CAP_SOURCE_FANOTIFY_INODE (1ULL << 13)
+#define KSM_CAP_MULTISOURCE_FANOTIFY (1ULL << 14)
+
+#define KSM_TX_CONFIG_SETTINGS (1U << 0)
+#define KSM_TX_CONFIG_POLICY (1U << 1)
+#define KSM_TX_CONFIG_MAPS (1U << 2)
+#define KSM_TX_CONFIG_KSTAT (1U << 3)
+#define KSM_TX_CONFIG_RESET_POLICY (1U << 4)
+
+#define KSM_MATCH_ANY_DEVICE (1U << 0)
+#define KSM_MAPS_FIELD_INO (1U << 0)
+#define KSM_MAPS_FIELD_DEV (1U << 1)
+#define KSM_MAPS_FIELD_PATH (1U << 2)
+#define KSM_MAPS_FIELDS_ALL ((1U << 3) - 1)
+
+#define KSM_KSTAT_FIELD_INO (1U << 0)
+#define KSM_KSTAT_FIELD_DEV (1U << 1)
+#define KSM_KSTAT_FIELD_NLINK (1U << 2)
+#define KSM_KSTAT_FIELD_SIZE (1U << 3)
+#define KSM_KSTAT_FIELD_ATIME (1U << 4)
+#define KSM_KSTAT_FIELD_MTIME (1U << 5)
+#define KSM_KSTAT_FIELD_CTIME (1U << 6)
+#define KSM_KSTAT_FIELD_BLKSIZE (1U << 7)
+#define KSM_KSTAT_FIELD_BLOCKS (1U << 8)
+#define KSM_KSTAT_FIELDS_ALL ((1U << 9) - 1)
+
+struct kasumi_transaction_maps_rule {
+    __u32 fields;
+    __u32 match_flags;
+    __aligned_u64 target_ino;
+    __aligned_u64 target_dev;
+    __aligned_u64 spoofed_ino;
+    __aligned_u64 spoofed_dev;
+    char spoofed_pathname[KSM_MAX_LEN_PATHNAME];
+};
+
+struct kasumi_transaction_kstat_rule {
+    __u32 fields;
+    __u32 match_flags;
+    __aligned_u64 target_ino;
+    __aligned_u64 target_dev;
+    __aligned_u64 spoofed_ino;
+    __aligned_u64 spoofed_dev;
+    __aligned_u64 spoofed_nlink;
+    __aligned_u64 spoofed_size;
+    __aligned_u64 spoofed_atime_sec;
+    __aligned_u64 spoofed_atime_nsec;
+    __aligned_u64 spoofed_mtime_sec;
+    __aligned_u64 spoofed_mtime_nsec;
+    __aligned_u64 spoofed_ctime_sec;
+    __aligned_u64 spoofed_ctime_nsec;
+    __aligned_u64 spoofed_blksize;
+    __aligned_u64 spoofed_blocks;
+    char target_pathname[KSM_MAX_LEN_PATHNAME];
+};
+
+struct kasumi_transaction_configuration {
+    __u32 size;
+    __u32 fields;
+    __aligned_u64 id;
+    __u32 enabled;
+    __u32 features;
+    __u32 stealth;
+    __u32 debug;
+    __u32 policy_owner;
+    __u32 policy_flags;
+    __u32 allow_count;
+    __u32 deny_count;
+    __aligned_u64 allow_uids;
+    __aligned_u64 deny_uids;
+    __u32 maps_count;
+    __u32 reserved1;
+    __aligned_u64 maps_rules;
+    __u32 kstat_count;
+    __u32 reserved2;
+    __aligned_u64 kstat_rules;
+    __aligned_u64 reserved[2];
+};
+
+#define KSM_IOC_STAGE_CONFIGURATION _IOW(KSM_IOC_MAGIC, 54, struct kasumi_transaction_configuration)
 
 #endif /* _KASUMI_UAPI_H */

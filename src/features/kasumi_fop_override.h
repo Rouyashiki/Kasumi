@@ -39,5 +39,6 @@ int kasumi_fop_bind_iterate_client(struct inode *inode,
 void kasumi_fop_unbind_iterate_client(struct inode *inode, void *data);
 void kasumi_fop_synchronize_iterate_clients(void);
 bool kasumi_fop_file_is_shadowed(const struct file *file);
+const struct file_operations *kasumi_fop_original_operations(const struct file *file);
 
 #endif /* _KASUMI_FOP_OVERRIDE_H */

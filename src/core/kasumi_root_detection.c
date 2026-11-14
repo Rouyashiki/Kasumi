@@ -11,6 +11,8 @@
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/kernel.h>
+#include <linux/jiffies.h>
+#include <linux/mutex.h>
 #include <linux/list.h>
 #include <linux/moduleparam.h>
 #include <linux/rbtree.h>
@@ -34,6 +36,7 @@
 #define KASUMI_KP_MAX_VMAP_AREAS 4096
 #define KASUMI_KP_VM_FLAGS 0x44UL
 #define KASUMI_KP_SU_NAME "su_get_path"
+#define KASUMI_KP_RETRY_MAX (60UL * HZ)
 
 struct kasumi_kp_symbol {
 	u64 addr;
@@ -97,6 +100,41 @@ bool kasumi_apatch_policy_lifetime_stable;
 static long (*kasumi_copy_from_kernel_nofault_fn)(void *dst, const void *src,
 						  size_t size);
 static bool kasumi_copy_from_kernel_nofault_tried;
+
+static DEFINE_MUTEX(kasumi_ap_detection_mutex);
+static unsigned long kasumi_ap_cached_policy;
+static unsigned long kasumi_ap_retry_after;
+static unsigned long kasumi_ap_retry_delay;
+static int (*kasumi_ap_core_kernel_text)(unsigned long addr);
+
+static void kasumi_ap_invalidate_cache_locked(void)
+{
+	kasumi_ap_cached_policy = 0;
+	kasumi_ap_retry_after = 0;
+	kasumi_ap_retry_delay = 0;
+}
+
+void kasumi_invalidate_apatch_cache(void)
+{
+	mutex_lock(&kasumi_ap_detection_mutex);
+	kasumi_ap_invalidate_cache_locked();
+	mutex_unlock(&kasumi_ap_detection_mutex);
+}
+
+static KASUMI_NOCFI void kasumi_ap_cache_stable_policy(void)
+{
+	unsigned long addr = (unsigned long)kasumi_ap_get_mod_exclude;
+
+	if (!addr)
+		return;
+	if (!kasumi_ap_core_kernel_text)
+		kasumi_ap_core_kernel_text =
+			(void *)kasumi_lookup_callable_quiet("core_kernel_text");
+	/* Vmalloc/KPM and unloadable module addresses remain uncached. */
+	if (kasumi_ap_core_kernel_text && kasumi_ap_core_kernel_text(addr))
+		kasumi_ap_cached_policy = addr;
+}
+
 
 static KASUMI_NOCFI struct file *kasumi_open_ro(const char *path)
 {
@@ -250,21 +288,16 @@ static bool kasumi_kp_scan_chunk(unsigned long base, const char *buf,
 }
 
 static bool kasumi_kp_scan_range(unsigned long start, unsigned long end,
-				 const char *tag)
+				 const char *tag, char *buf)
 {
-	char *buf;
 	unsigned long p;
 
 	if (!kasumi_valid_kernel_addr(start) || !kasumi_valid_kernel_addr(end) ||
-	    end <= start || end - start > 512UL * 1024 * 1024) {
+	    end <= start || end - start > KASUMI_KP_MAX_SCAN_RANGE) {
 		pr_warn("Kasumi: skip KP %s scan, bad range [%lx, %lx)\n",
 			tag, start, end);
 		return false;
 	}
-
-	buf = kmalloc(KASUMI_KP_SCAN_CHUNK + KASUMI_KP_SCAN_OVERLAP, GFP_KERNEL);
-	if (!buf)
-		return false;
 
 	for (p = start; p < end; p += KASUMI_KP_SCAN_CHUNK) {
 		size_t len = min_t(unsigned long,
@@ -274,18 +307,16 @@ static bool kasumi_kp_scan_range(unsigned long start, unsigned long end,
 		if (!kasumi_kernel_read_nofault(buf, p, len))
 			continue;
 		if (kasumi_kp_scan_chunk(p, buf, len)) {
-			kfree(buf);
 			pr_info("Kasumi: APatch KP symbol table found in %s range [%lx, %lx)\n",
 				tag, start, end);
 			return true;
 		}
 	}
 
-	kfree(buf);
 	return false;
 }
 
-static bool kasumi_kp_scan_kernel_image(void)
+static bool kasumi_kp_scan_kernel_image(char *buf)
 {
 	unsigned long start = kasumi_lookup_callable_quiet("_text");
 	unsigned long end = kasumi_lookup_callable_quiet("_end");
@@ -293,13 +324,14 @@ static bool kasumi_kp_scan_kernel_image(void)
 	if (!kasumi_valid_kernel_addr(start))
 		start = kasumi_lookup_callable_quiet("_stext");
 
-	if (kasumi_kp_scan_range(start, end, "kernel image"))
+	if (kasumi_kp_scan_range(start, end, "kernel image", buf))
 		return true;
 
 	return false;
 }
 
-static bool kasumi_kp_scan_vmap_list(unsigned long head_addr, const char *tag)
+static bool kasumi_kp_scan_vmap_list(unsigned long head_addr, const char *tag,
+				     char *buf)
 {
 	struct kasumi_kp_vmap_area va;
 	struct list_head head;
@@ -335,7 +367,7 @@ static bool kasumi_kp_scan_vmap_list(unsigned long head_addr, const char *tag)
 			    vm.flags == KASUMI_KP_VM_FLAGS) {
 				pr_info("Kasumi: scanning APatch-like vmap [%lx, %lx) caller=%px\n",
 					va.va_start, va.va_end, vm.caller);
-				if (kasumi_kp_scan_range(va.va_start, va.va_end, tag))
+				if (kasumi_kp_scan_range(va.va_start, va.va_end, tag, buf))
 					return true;
 			}
 		}
@@ -346,7 +378,7 @@ static bool kasumi_kp_scan_vmap_list(unsigned long head_addr, const char *tag)
 	return false;
 }
 
-static bool kasumi_kp_scan_vmap_nodes(void)
+static bool kasumi_kp_scan_vmap_nodes(char *buf)
 {
 	unsigned long nodes_sym = kasumi_lookup_callable_quiet("vmap_nodes");
 	unsigned long nr_sym = kasumi_lookup_callable_quiet("nr_vmap_nodes");
@@ -366,41 +398,52 @@ static bool kasumi_kp_scan_vmap_nodes(void)
 		unsigned long head_addr =
 			(unsigned long)&nodes[i].busy.head;
 
-		if (kasumi_kp_scan_vmap_list(head_addr, "vmalloc"))
+		if (kasumi_kp_scan_vmap_list(head_addr, "vmalloc", buf))
 			return true;
 	}
 
 	return false;
 }
 
-static bool kasumi_kp_scan_legacy_vmap_list(void)
+static bool kasumi_kp_scan_legacy_vmap_list(char *buf)
 {
 	unsigned long head_addr = kasumi_lookup_callable_quiet("vmap_area_list");
 
 	if (!kasumi_valid_kernel_addr(head_addr))
 		return false;
 
-	return kasumi_kp_scan_vmap_list(head_addr, "vmalloc");
+	return kasumi_kp_scan_vmap_list(head_addr, "vmalloc", buf);
 }
 
 static bool kasumi_kp_scan_symbols(void)
 {
-	if (kasumi_kp_scan_kernel_image())
-		return true;
-	if (kasumi_kp_scan_vmap_nodes())
-		return true;
-	if (kasumi_kp_scan_legacy_vmap_list())
-		return true;
+	char *buf;
+	bool found;
 
-	pr_info("Kasumi: APatch KP symbol table not found in scanned memory\n");
-	return false;
+	buf = kmalloc(KASUMI_KP_SCAN_CHUNK + KASUMI_KP_SCAN_OVERLAP, GFP_KERNEL);
+	if (!buf)
+		return false;
+	found = kasumi_kp_scan_kernel_image(buf) ||
+		kasumi_kp_scan_vmap_nodes(buf) ||
+		kasumi_kp_scan_legacy_vmap_list(buf);
+	kfree(buf);
+	if (!found)
+		pr_info("Kasumi: APatch KP symbol table not found in scanned memory\n");
+	return found;
 }
 
-static bool kasumi_apatch_detect(void)
+static bool kasumi_apatch_detect_locked(bool refresh)
 {
 	unsigned long a;
 
+	if (refresh)
+		kasumi_ap_invalidate_cache_locked();
 	kasumi_ap_clear_symbols();
+	if (kasumi_ap_cached_policy) {
+		kasumi_ap_get_mod_exclude = (void *)kasumi_ap_cached_policy;
+		kasumi_apatch_policy_lifetime_stable = true;
+		return true;
+	}
 
 	a = kasumi_lookup_callable_quiet("su_get_path");
 	if (!a)
@@ -416,30 +459,49 @@ static bool kasumi_apatch_detect(void)
 				(void *)kasumi_lookup_callable_quiet(
 					"kp_su_get_ap_mod_exclude");
 		pr_info("Kasumi: APatch sucompat detected via kallsyms\n");
-		return true;
+		goto found;
 	}
 
-	if (kasumi_kp_scan_symbols()) {
-		pr_info("Kasumi: APatch sucompat detected via KP symbol scan\n");
-		return true;
+	/* Cheap symbol lookup still notices providers loaded during backoff. */
+	if (kasumi_ap_retry_delay && time_before(jiffies, kasumi_ap_retry_after))
+		return false;
+	if (!kasumi_kp_scan_symbols()) {
+		kasumi_ap_retry_delay = kasumi_ap_retry_delay ?
+			min(kasumi_ap_retry_delay * 2, KASUMI_KP_RETRY_MAX) : HZ;
+		kasumi_ap_retry_after = jiffies + kasumi_ap_retry_delay;
+		return false;
 	}
-
-	return false;
+	pr_info("Kasumi: APatch sucompat detected via KP symbol scan\n");
+found:
+	kasumi_ap_retry_delay = 0;
+	kasumi_ap_cache_stable_policy();
+	return true;
 }
 
 bool kasumi_refresh_apatch_policy(void)
 {
-	bool detected = kasumi_apatch_detect();
+	bool detected;
+	bool available;
 
+	mutex_lock(&kasumi_ap_detection_mutex);
+	detected = kasumi_apatch_detect_locked(true);
 	if (detected)
 		kasumi_root_mask |= KASUMI_ROOT_APATCH;
-	return detected && kasumi_ap_get_mod_exclude;
+	available = detected && kasumi_ap_get_mod_exclude;
+	mutex_unlock(&kasumi_ap_detection_mutex);
+	return available;
 }
 
 bool kasumi_probe_apatch_policy(unsigned long *addr, bool *lifetime_stable)
 {
-	bool available = kasumi_refresh_apatch_policy();
+	bool detected;
+	bool available;
 
+	mutex_lock(&kasumi_ap_detection_mutex);
+	detected = kasumi_apatch_detect_locked(false);
+	if (detected)
+		kasumi_root_mask |= KASUMI_ROOT_APATCH;
+	available = detected && kasumi_ap_get_mod_exclude;
 	if (addr)
 		*addr = available ? (unsigned long)kasumi_ap_get_mod_exclude : 0;
 	if (lifetime_stable)
@@ -448,6 +510,7 @@ bool kasumi_probe_apatch_policy(unsigned long *addr, bool *lifetime_stable)
 	/* The caller decides when the probed provider becomes visible. */
 	WRITE_ONCE(kasumi_ap_get_mod_exclude, NULL);
 	kasumi_apatch_policy_lifetime_stable = false;
+	mutex_unlock(&kasumi_ap_detection_mutex);
 	return available;
 }
 
@@ -549,7 +612,10 @@ void kasumi_root_detect(void)
 	if (!ksu_active && (kasumi_root_mask & KASUMI_ROOT_KSU))
 		pr_warn("Kasumi: KernelSU detected without allowlist policy source\n");
 
-	if (kasumi_apatch_detect()) {
+	mutex_lock(&kasumi_ap_detection_mutex);
+	apatch_active = kasumi_apatch_detect_locked(true);
+	mutex_unlock(&kasumi_ap_detection_mutex);
+	if (apatch_active) {
 		kasumi_root_mask |= KASUMI_ROOT_APATCH;
 		apatch_active = kasumi_ap_get_mod_exclude != NULL;
 		if (!apatch_active)

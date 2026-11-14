@@ -62,7 +62,8 @@
 #define KASUMI_MAX_MERGE_TARGETS 4
 
 extern bool kasumi_debug_enabled;
+bool kasumi_config_debug(void);
 
-#define kasumi_log(fmt, ...) (void)(kasumi_debug_enabled && pr_info("Kasumi: " fmt, ##__VA_ARGS__))
+#define kasumi_log(fmt, ...) (void)(kasumi_config_debug() && pr_info("Kasumi: " fmt, ##__VA_ARGS__))
 
 #endif /* _KASUMI_BASE_H */

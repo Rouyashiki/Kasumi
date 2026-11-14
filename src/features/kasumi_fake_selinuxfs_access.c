@@ -57,13 +57,13 @@ static struct file_operations kasumi_proc_attr_proxy_fops;
 static struct tracepoint *kasumi_proc_attr_open_tp;
 static bool kasumi_proc_attr_accepting;
 
-static unsigned int kasumi_guard_pad_ns = 1000;
+static unsigned int kasumi_guard_pad_ns = 100;
 static atomic64_t kasumi_guard_pad_count = ATOMIC64_INIT(0);
 module_param_named(kasumi_guard_pad_ns, kasumi_guard_pad_ns, uint, 0600);
 MODULE_PARM_DESC(kasumi_guard_pad_ns,
-		 "SELinux Guard padding in ns, capped at 2000; default 1000");
+		 "SELinux Guard padding in ns, capped at 200; default 100");
 
-#define KASUMI_GUARD_MAX_SPIN_NS 2000U
+#define KASUMI_GUARD_MAX_SPIN_NS 200U
 #define KASUMI_GUARD_MAX_SPIN_ITERS 256U
 
 static bool kasumi_guard_skips_parse(const char __user *buf, size_t count)
