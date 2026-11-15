@@ -80,6 +80,16 @@ kasumi-rwsem-compat-cflags := \
 CFLAGS_core/kasumi_vnode.o += $(kasumi-rwsem-compat-cflags)
 # Applying the same names here makes the kernel declarations check our ABI.
 CFLAGS_core/kasumi_rwsem_compat.o += $(kasumi-rwsem-compat-cflags)
+
+# Match the VFS allocation APIs exposed by the build headers.
+kasumi-public-alloc-inode := $(shell grep -E '^[[:space:]]*(extern[[:space:]]+)?struct[[:space:]]+inode[[:space:]]*\*[[:space:]]*alloc_inode\b' $(srctree)/include/linux/fs.h)
+ifneq ($(kasumi-public-alloc-inode),)
+CFLAGS_core/kasumi_sop_shadow.o += -DKASUMI_VFS_ALLOC_INODE_PUBLIC
+endif
+kasumi-iget5-locked-rcu := $(shell grep -E '^[[:space:]]*(extern[[:space:]]+)?struct[[:space:]]+inode[[:space:]]*\*[[:space:]]*iget5_locked_rcu\b' $(srctree)/include/linux/fs.h)
+ifneq ($(kasumi-iget5-locked-rcu),)
+CFLAGS_core/kasumi_sop_shadow.o += -DKASUMI_HAS_IGET5_LOCKED_RCU
+endif
 CFLAGS_hooks/kasumi_proc_seq.o += -I$(srctree)
 CFLAGS_features/kasumi_exec_view.o += -I$(srctree)
 CFLAGS_features/kasumi_vfs_view.o += -I$(srctree)
