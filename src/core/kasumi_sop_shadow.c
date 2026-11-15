@@ -20,13 +20,16 @@
 #include "kasumi_vnode.h"
 #include "kasumi_identity.h"
 
+#include <linux/bitops.h>
 #include <linux/fs.h>
 #include <linux/hashtable.h>
+#include <linux/kallsyms.h>
 #include <linux/kprobes.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/rcupdate.h>
 #include <linux/slab.h>
+#include <linux/sizes.h>
 #include <linux/spinlock.h>
 #include <linux/srcu.h>
 #include <linux/wait.h>
@@ -173,10 +176,91 @@ static struct kprobe kasumi_sop_reader_probes[] = {
 	{ .symbol_name = "generic_shutdown_super", .pre_handler = kasumi_sop_shutdown_pre },
 };
 
+struct kasumi_sop_symbol_ops {
+	const char *(*lookup)(unsigned long, unsigned long *, unsigned long *,
+			      char **, char *);
+	long (*read_code)(void *, const void *, size_t);
+};
+
+static KASUMI_NOCFI bool
+kasumi_sop_core_entry(const struct kasumi_sop_symbol_ops *ops,
+		      unsigned long address, const char *name,
+		      unsigned long *size)
+{
+	unsigned long offset;
+	char buffer[KSYM_NAME_LEN];
+	char *module = NULL;
+	const char *symbol;
+
+	if (!address || (address & 3))
+		return false;
+	symbol = ops->lookup(address, size, &offset, &module, buffer);
+	return symbol && !module && !offset && !strcmp(symbol, name) &&
+	       *size >= sizeof(u32) && *size <= SZ_16K && !(*size & 3);
+}
+
+static KASUMI_NOCFI bool
+kasumi_sop_calls(const struct kasumi_sop_symbol_ops *ops, unsigned long caller,
+		 unsigned long size, unsigned long callee)
+{
+	unsigned long offset;
+	u32 instruction;
+
+	for (offset = 0; offset < size; offset += sizeof(instruction)) {
+		if (ops->read_code(&instruction, (void *)(caller + offset),
+				   sizeof(instruction)))
+			return false;
+		instruction = le32_to_cpu(instruction);
+		if ((instruction & 0xfc000000U) == 0x94000000U &&
+		    caller + offset +
+			    sign_extend64(instruction & 0x03ffffffU, 25) * 4 ==
+			callee)
+			return true;
+	}
+	return false;
+}
+
+static bool kasumi_sop_reader_targets_valid(void)
+{
+	struct kasumi_sop_symbol_ops ops = {
+	    .lookup = (void *)kasumi_lookup_callable_quiet("kallsyms_lookup"),
+	    .read_code = (void *)kasumi_lookup_callable_quiet(
+		"copy_from_kernel_nofault"),
+	};
+	unsigned long new_inode_addr = kasumi_lookup_name_quiet("new_inode");
+	unsigned long init_addr = kasumi_lookup_name_quiet("inode_init_always");
+	unsigned long sizes[ARRAY_SIZE(kasumi_sop_reader_probes)],
+	    new_inode_size, init_size;
+	unsigned int i;
+
+	if (!ops.lookup || !ops.read_code ||
+	    !kasumi_sop_core_entry(&ops, new_inode_addr, "new_inode",
+				   &new_inode_size) ||
+	    !kasumi_sop_core_entry(&ops, init_addr, "inode_init_always",
+				   &init_size))
+		return false;
+	for (i = 0; i < ARRAY_SIZE(kasumi_sop_reader_probes); ++i) {
+		struct kprobe *probe = &kasumi_sop_reader_probes[i];
+
+		if (!kasumi_sop_core_entry(&ops, (unsigned long)probe->addr,
+					   probe->symbol_name, &sizes[i]))
+			return false;
+	}
+	/* IncFS also defines alloc_inode; a name match cannot identify the VFS
+	 * allocator. */
+	return kasumi_sop_calls(
+		   &ops, new_inode_addr, new_inode_size,
+		   (unsigned long)kasumi_sop_reader_probes[0].addr) &&
+	       kasumi_sop_calls(&ops,
+				(unsigned long)kasumi_sop_reader_probes[0].addr,
+				sizes[0], init_addr);
+}
+
 static int kasumi_sop_reader_pre(struct pt_regs *regs, unsigned long entry)
 {
 #ifdef CONFIG_ARM64
-	if (READ_ONCE(kasumi_sop_readers_stopping) || kasumi_sop_reader_guarded())
+	if (smp_load_acquire(&kasumi_sop_readers_stopping) ||
+	    kasumi_sop_reader_guarded())
 		return 0;
 	atomic_inc(&kasumi_sop_reader_active);
 	instruction_pointer_set(regs, entry);
@@ -196,6 +280,8 @@ static int kasumi_sop_evict_pre(struct kprobe *probe, struct pt_regs *regs)
 #ifdef CONFIG_ARM64
 	struct inode *inode = (struct inode *)regs->regs[0];
 
+	if (smp_load_acquire(&kasumi_sop_readers_stopping))
+		return 0;
 	if (inode && !READ_ONCE(inode->i_nlink) && !kasumi_vnode_is_ours(inode))
 		kasumi_identity_source_evict(inode->i_sb->s_dev, inode->i_ino);
 #endif
@@ -207,6 +293,8 @@ static int kasumi_sop_shutdown_pre(struct kprobe *probe, struct pt_regs *regs)
 #ifdef CONFIG_ARM64
 	struct super_block *sb = (struct super_block *)regs->regs[0];
 
+	if (smp_load_acquire(&kasumi_sop_readers_stopping))
+		return 0;
 	if (sb)
 		kasumi_identity_source_unmount(sb->s_dev);
 #endif
@@ -220,15 +308,22 @@ static int kasumi_sop_destroy_pre(struct kprobe *probe, struct pt_regs *regs)
 
 static void kasumi_sop_readers_stop(void)
 {
+	unsigned int i;
+
 	mutex_lock(&kasumi_sop_reader_manage_lock);
 	if (kasumi_sop_readers_stopping && !kasumi_sop_reader_registered)
-		goto unlock;
+		goto reset;
 	WRITE_ONCE(kasumi_sop_readers_stopping, true);
 	while (kasumi_sop_reader_registered)
 		unregister_kprobe(&kasumi_sop_reader_probes[--kasumi_sop_reader_registered]);
 	wait_event(kasumi_sop_wait, !atomic_read(&kasumi_sop_reader_active));
 	kasumi_synchronize_rcu_tasks();
-unlock:
+reset:
+	for (i = 0; i < ARRAY_SIZE(kasumi_sop_reader_probes); ++i)
+		kasumi_sop_reader_probes[i].addr = NULL;
+	kasumi_sop_native_alloc = NULL;
+	kasumi_sop_native_evict = NULL;
+	kasumi_sop_native_destroy = NULL;
 	mutex_unlock(&kasumi_sop_reader_manage_lock);
 }
 
@@ -240,23 +335,35 @@ static int kasumi_sop_readers_init(void)
 #ifndef CONFIG_ARM64
 	return -EOPNOTSUPP;
 #endif
-	kasumi_sop_native_alloc = (void *)kasumi_lookup_callable_quiet("alloc_inode");
-	kasumi_sop_native_evict = (void *)kasumi_lookup_callable_quiet("evict");
-	kasumi_sop_native_destroy = (void *)kasumi_lookup_callable_quiet("__destroy_inode");
-	if (!kasumi_sop_native_alloc || !kasumi_sop_native_evict || !kasumi_sop_native_destroy)
-		return -EOPNOTSUPP;
 	for (i = 0; i < ARRAY_SIZE(kasumi_sop_reader_probes); ++i) {
+		kasumi_sop_reader_probes[i].flags = KPROBE_FLAG_DISABLED;
 		ret = register_kprobe(&kasumi_sop_reader_probes[i]);
-		if (ret) {
-			kasumi_sop_readers_stop();
-			return ret;
-		}
+		if (ret)
+			goto fail;
 		kasumi_sop_reader_registered++;
 	}
-	WRITE_ONCE(kasumi_sop_readers_stopping, false);
+	if (!kasumi_sop_reader_targets_valid()) {
+		pr_err("kasumi: refusing unverified VFS reader targets\n");
+		ret = -EOPNOTSUPP;
+		goto fail;
+	}
+	/* The no-CFI wrappers must re-enter exactly the instruction we
+	 * intercept. */
+	kasumi_sop_native_alloc = (void *)kasumi_sop_reader_probes[0].addr;
+	kasumi_sop_native_evict = (void *)kasumi_sop_reader_probes[1].addr;
+	kasumi_sop_native_destroy = (void *)kasumi_sop_reader_probes[2].addr;
+	for (i = 0; i < ARRAY_SIZE(kasumi_sop_reader_probes); ++i) {
+		ret = enable_kprobe(&kasumi_sop_reader_probes[i]);
+		if (ret)
+			goto fail;
+	}
+	smp_store_release(&kasumi_sop_readers_stopping, false);
 	/* Pre-install callers can only retain the unmodified native vector. */
 	kasumi_synchronize_rcu_tasks();
 	return 0;
+fail:
+	kasumi_sop_readers_stop();
+	return ret;
 }
 
 static void kasumi_sop_reap_workfn(struct work_struct *work);

@@ -385,11 +385,16 @@ int kasumi_bootstrap_init(void)
 		pr_err("kasumi: asynchronous I/O bridge unavailable: %d\n", ret);
 		goto err_fop_bridge;
 	}
+	ret = kasumi_sop_shadow_init();
+	if (ret) {
+		pr_err("kasumi: VFS inode reader guards unavailable: %d\n",
+		       ret);
+		goto err_fop_bridge;
+	}
 	ret = kasumi_file_lock_init();
 	if (ret)
 		pr_warn("kasumi: source file lock bridge unavailable: %d\n", ret);
 	(void)kasumi_fop_override_init();
-	(void)kasumi_sop_shadow_init();
 	(void)kasumi_dirhijack_init();
 
 	/* On old KMI, the first ingress table published below is the module-init
