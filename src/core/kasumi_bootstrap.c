@@ -19,6 +19,7 @@
 #include "kasumi_config_guard.h"
 #include "kasumi_module_guard.h"
 #include "kasumi_runtime.h"
+#include "kasumi_rwsem_compat.h"
 #include "kasumi_vfs_view.h"
 #include "kasumi_exec_view.h"
 #include "kasumi_notify_view.h"
@@ -130,6 +131,7 @@ static noinline KASUMI_NOCFI void kasumi_resolve_system_dev(void)
 
 static int kasumi_resolve_runtime_symbols(void)
 {
+	kasumi_rwsem_compat_init();
 	kasumi_kern_path = (void *)kasumi_lookup_callable("kern_path");
 	if (!kasumi_kern_path) {
 		pr_err("Kasumi: FATAL - kern_path not found\n");

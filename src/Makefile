@@ -28,6 +28,7 @@ kasumi_lkm-objs := \
 	core/kasumi_fop_bridge.o \
 	core/kasumi_vnode.o \
 	core/kasumi_vnode_handle.o \
+	core/kasumi_rwsem_compat.o \
 	core/kasumi_dirhijack.o \
 	core/kasumi_hide_events.o \
 	core/kasumi_hide_rules.o \
@@ -68,6 +69,17 @@ kasumi_lkm-objs := \
 kasumi_lkm-$(CONFIG_ARM64) += hooks/arm64/kasumi_patch_memory.o
 
 ccflags-y += -gz=none
+# Keep native rwsem inlines without requiring newer Android tracing helpers.
+kasumi-rwsem-starttime-decl := $(shell sed -n '/^void _trace_android_vh_record_pcpu_rwsem_starttime/{:a; /;/!{N;ba};p;}' $(srctree)/include/linux/percpu-rwsem.h)
+ifneq ($(findstring struct percpu_rw_semaphore,$(kasumi-rwsem-starttime-decl)),)
+ccflags-y += -DKASUMI_RWSEM_STARTTIME_USES_SEM
+endif
+kasumi-rwsem-compat-cflags := \
+	-D_trace_android_vh_record_pcpu_rwsem_starttime=kasumi_trace_pcpu_rwsem_starttime \
+	-D_trace_android_vh_record_pcpu_rwsem_time_early=kasumi_trace_pcpu_rwsem_time_early
+CFLAGS_core/kasumi_vnode.o += $(kasumi-rwsem-compat-cflags)
+# Applying the same names here makes the kernel declarations check our ABI.
+CFLAGS_core/kasumi_rwsem_compat.o += $(kasumi-rwsem-compat-cflags)
 CFLAGS_hooks/kasumi_proc_seq.o += -I$(srctree)
 CFLAGS_features/kasumi_exec_view.o += -I$(srctree)
 CFLAGS_features/kasumi_vfs_view.o += -I$(srctree)
