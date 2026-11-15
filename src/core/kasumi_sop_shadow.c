@@ -222,38 +222,63 @@ kasumi_sop_calls(const struct kasumi_sop_symbol_ops *ops, unsigned long caller,
 
 static bool kasumi_sop_reader_targets_valid(void)
 {
+	static const char *const init_names[] = {
+	    "inode_init_always",
+	    "inode_init_always_gfp",
+	};
 	struct kasumi_sop_symbol_ops ops = {
 	    .lookup = (void *)kasumi_lookup_callable_quiet("kallsyms_lookup"),
 	    .read_code = (void *)kasumi_lookup_callable_quiet(
 		"copy_from_kernel_nofault"),
 	};
 	unsigned long new_inode_addr = kasumi_lookup_name_quiet("new_inode");
-	unsigned long init_addr = kasumi_lookup_name_quiet("inode_init_always");
 	unsigned long sizes[ARRAY_SIZE(kasumi_sop_reader_probes)],
-	    new_inode_size, init_size;
+	    new_inode_size;
 	unsigned int i;
 
-	if (!ops.lookup || !ops.read_code ||
-	    !kasumi_sop_core_entry(&ops, new_inode_addr, "new_inode",
-				   &new_inode_size) ||
-	    !kasumi_sop_core_entry(&ops, init_addr, "inode_init_always",
-				   &init_size))
+	if (!ops.lookup || !ops.read_code) {
+		pr_err("kasumi: VFS reader validation helpers unavailable\n");
 		return false;
+	}
+	if (!kasumi_sop_core_entry(&ops, new_inode_addr, "new_inode",
+				   &new_inode_size)) {
+		pr_err("kasumi: invalid VFS new_inode entry\n");
+		return false;
+	}
 	for (i = 0; i < ARRAY_SIZE(kasumi_sop_reader_probes); ++i) {
 		struct kprobe *probe = &kasumi_sop_reader_probes[i];
 
 		if (!kasumi_sop_core_entry(&ops, (unsigned long)probe->addr,
-					   probe->symbol_name, &sizes[i]))
+					   probe->symbol_name, &sizes[i])) {
+			pr_err("kasumi: invalid VFS reader entry: %s\n",
+			       probe->symbol_name);
 			return false;
+		}
 	}
 	/* IncFS also defines alloc_inode; a name match cannot identify the VFS
 	 * allocator. */
-	return kasumi_sop_calls(
-		   &ops, new_inode_addr, new_inode_size,
-		   (unsigned long)kasumi_sop_reader_probes[0].addr) &&
-	       kasumi_sop_calls(&ops,
-				(unsigned long)kasumi_sop_reader_probes[0].addr,
-				sizes[0], init_addr);
+	if (!kasumi_sop_calls(
+		&ops, new_inode_addr, new_inode_size,
+		(unsigned long)kasumi_sop_reader_probes[0].addr)) {
+		pr_err("kasumi: VFS new_inode does not call the probed "
+		       "allocator\n");
+		return false;
+	}
+	for (i = 0; i < ARRAY_SIZE(init_names); ++i) {
+		unsigned long init_addr =
+		    kasumi_lookup_name_quiet(init_names[i]);
+		unsigned long init_size;
+
+		if (kasumi_sop_core_entry(&ops, init_addr, init_names[i],
+					  &init_size) &&
+		    kasumi_sop_calls(
+			&ops, (unsigned long)kasumi_sop_reader_probes[0].addr,
+			sizes[0], init_addr))
+			return true;
+	}
+	pr_err(
+	    "kasumi: VFS allocator has no verified inode initializer call\n");
+	return false;
 }
 
 static int kasumi_sop_reader_pre(struct pt_regs *regs, unsigned long entry)

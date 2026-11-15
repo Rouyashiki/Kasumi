@@ -72,6 +72,7 @@ int kasumi_vnode_handle_init(void)
 			error = -EOPNOTSUPP;
 			goto fail;
 		}
+		probe->addr = NULL;
 		error = register_kprobe(probe);
 		if (error)
 			goto fail;

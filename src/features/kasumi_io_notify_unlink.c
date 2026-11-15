@@ -166,6 +166,7 @@ int kasumi_io_notify_unlink_init(void)
 	if (!kasumi_io_destroy_marks || !kasumi_io_get_mark || !kasumi_io_unlink_barrier ||
 	    !kasumi_io_mark_srcu)
 		return -EOPNOTSUPP;
+	kasumi_io_unlink_probe.addr = NULL;
 	error = register_kprobe(&kasumi_io_unlink_probe);
 	if (!error)
 		kasumi_io_unlink_registered = true;
