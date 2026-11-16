@@ -32,6 +32,7 @@
 #include <linux/sizes.h>
 #include <linux/spinlock.h>
 #include <linux/srcu.h>
+#include <linux/tracepoint.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/version.h>
@@ -84,6 +85,8 @@ DEFINE_STATIC_SRCU(kasumi_sop_readers);
 static atomic_t kasumi_sop_reader_active = ATOMIC_INIT(0);
 static bool kasumi_sop_readers_stopping = true;
 static unsigned int kasumi_sop_reader_registered;
+static struct tracepoint *kasumi_sop_evict_tp;
+static bool kasumi_sop_evict_tp_registered;
 
 static bool kasumi_sop_reader_guarded(void)
 {
@@ -142,6 +145,8 @@ enum kasumi_sop_reader_id {
 	KASUMI_SOP_DESTROY,
 	KASUMI_SOP_SHUTDOWN,
 	KASUMI_SOP_ALLOC_INODE,
+	KASUMI_SOP_IPUT,
+	KASUMI_SOP_DISPOSE_LIST,
 	KASUMI_SOP_READER_COUNT,
 };
 
@@ -155,6 +160,14 @@ static const char *const kasumi_sop_reader_names[] = {
     [KASUMI_SOP_DESTROY] = "__destroy_inode",
     [KASUMI_SOP_SHUTDOWN] = "generic_shutdown_super",
     [KASUMI_SOP_ALLOC_INODE] = "alloc_inode",
+    [KASUMI_SOP_IPUT] = "iput",
+    [KASUMI_SOP_DISPOSE_LIST] = "dispose_list",
+};
+
+static const char *const kasumi_sop_dispose_callers[] = {
+    "evict_inodes",
+    "invalidate_inodes",
+    "prune_icache_sb",
 };
 
 static struct inode *kasumi_sop_new_entry(struct super_block *sb);
@@ -173,6 +186,8 @@ kasumi_sop_iget5_rcu_entry(struct super_block *sb, unsigned long hashval,
 			   int (*set)(struct inode *, void *), void *data);
 static void kasumi_sop_evict_entry(struct inode *inode);
 static void kasumi_sop_destroy_entry(struct inode *inode);
+static void kasumi_sop_iput_entry(struct inode *inode);
+static void kasumi_sop_dispose_entry(struct list_head *head);
 static int kasumi_sop_reader_probe_pre(struct kprobe *probe,
 				       struct pt_regs *regs);
 static int kasumi_sop_evict_pre(struct kprobe *probe, struct pt_regs *regs);
@@ -230,6 +245,16 @@ static struct kasumi_sop_reader_target kasumi_sop_reader_targets[] = {
 	{
 	    .probe.pre_handler = kasumi_sop_reader_probe_pre,
 	    .entry = (unsigned long)kasumi_sop_alloc_entry,
+	},
+    [KASUMI_SOP_IPUT] =
+	{
+	    .probe.pre_handler = kasumi_sop_reader_probe_pre,
+	    .entry = (unsigned long)kasumi_sop_iput_entry,
+	},
+    [KASUMI_SOP_DISPOSE_LIST] =
+	{
+	    .probe.pre_handler = kasumi_sop_reader_probe_pre,
+	    .entry = (unsigned long)kasumi_sop_dispose_entry,
 	},
 };
 
@@ -343,6 +368,28 @@ static KASUMI_NOCFI void kasumi_sop_destroy_entry(struct inode *inode)
 	kasumi_sop_reader_leave(&guard);
 }
 
+static KASUMI_NOCFI void kasumi_sop_iput_entry(struct inode *inode)
+{
+	typeof(iput) *native =
+	    (void *)kasumi_sop_reader_targets[KASUMI_SOP_IPUT].native;
+	struct kasumi_sop_reader_guard guard;
+
+	kasumi_sop_reader_enter(&guard);
+	native(inode);
+	kasumi_sop_reader_leave(&guard);
+}
+
+static KASUMI_NOCFI void kasumi_sop_dispose_entry(struct list_head *head)
+{
+	void (*native)(struct list_head *) =
+	    (void *)kasumi_sop_reader_targets[KASUMI_SOP_DISPOSE_LIST].native;
+	struct kasumi_sop_reader_guard guard;
+
+	kasumi_sop_reader_enter(&guard);
+	native(head);
+	kasumi_sop_reader_leave(&guard);
+}
+
 struct kasumi_sop_symbol_ops {
 	const char *(*lookup)(unsigned long, unsigned long *, unsigned long *,
 			      char **, char *);
@@ -352,6 +399,8 @@ struct kasumi_sop_symbol_ops {
 struct kasumi_sop_reader_symbols {
 	unsigned long addresses[ARRAY_SIZE(kasumi_sop_reader_names)];
 	bool ambiguous[ARRAY_SIZE(kasumi_sop_reader_names)];
+	unsigned long dispose_callers[ARRAY_SIZE(kasumi_sop_dispose_callers)];
+	bool dispose_ambiguous[ARRAY_SIZE(kasumi_sop_dispose_callers)];
 };
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
@@ -376,6 +425,14 @@ static int kasumi_sop_collect_symbol(void *data, const char *name,
 		if (symbols->addresses[i] && symbols->addresses[i] != address)
 			symbols->ambiguous[i] = true;
 		symbols->addresses[i] = address;
+	}
+	for (i = 0; i < ARRAY_SIZE(kasumi_sop_dispose_callers); ++i) {
+		if (strcmp(name, kasumi_sop_dispose_callers[i]))
+			continue;
+		if (symbols->dispose_callers[i] &&
+		    symbols->dispose_callers[i] != address)
+			symbols->dispose_ambiguous[i] = true;
+		symbols->dispose_callers[i] = address;
 	}
 	return 0;
 }
@@ -417,6 +474,29 @@ kasumi_sop_calls(const struct kasumi_sop_symbol_ops *ops, unsigned long caller,
 			return true;
 	}
 	return false;
+}
+
+static KASUMI_NOCFI bool
+kasumi_sop_dispose_validate(const struct kasumi_sop_symbol_ops *ops,
+			    const struct kasumi_sop_reader_symbols *symbols)
+{
+	unsigned long dispose = symbols->addresses[KASUMI_SOP_DISPOSE_LIST];
+	unsigned int i;
+
+	/* Every batch eviction path must still reach the guarded local list. */
+	for (i = 0; i < ARRAY_SIZE(kasumi_sop_dispose_callers); ++i) {
+		unsigned long caller = symbols->dispose_callers[i];
+		unsigned long size = kasumi_sop_core_entry(
+		    ops, caller, kasumi_sop_dispose_callers[i]);
+
+		if (symbols->dispose_ambiguous[i] || !size ||
+		    !kasumi_sop_calls(ops, caller, size, dispose)) {
+			pr_err("kasumi: unverified VFS disposal caller: %s\n",
+			       kasumi_sop_dispose_callers[i]);
+			return false;
+		}
+	}
+	return true;
 }
 
 struct kasumi_sop_allocator_search {
@@ -485,6 +565,11 @@ static KASUMI_NOCFI bool kasumi_sop_reader_targets_prepare(void)
 
 		if (i == KASUMI_SOP_ALLOC_INODE)
 			continue;
+		if (i == KASUMI_SOP_EVICT && !address)
+			continue;
+		if ((i == KASUMI_SOP_IPUT || i == KASUMI_SOP_DISPOSE_LIST) &&
+		    symbols.addresses[KASUMI_SOP_EVICT])
+			continue;
 #ifdef KASUMI_VFS_ALLOC_INODE_PUBLIC
 		/* The public alloc_inode API replaces new_inode_pseudo. */
 		if (i == KASUMI_SOP_NEW_INODE_PSEUDO && !address)
@@ -511,6 +596,9 @@ static KASUMI_NOCFI bool kasumi_sop_reader_targets_prepare(void)
 	    (void *)kasumi_lookup_callable_quiet("copy_from_kernel_nofault");
 	if (!ops.read_code ||
 	    each_symbol(kasumi_sop_collect_allocator, &allocator))
+		return false;
+	if (!symbols.addresses[KASUMI_SOP_EVICT] &&
+	    !kasumi_sop_dispose_validate(&ops, &symbols))
 		return false;
 	if (!allocator.address || allocator.ambiguous) {
 		pr_err("kasumi: no unique VFS allocator target\n");
@@ -557,6 +645,25 @@ static int kasumi_sop_evict_pre(struct kprobe *probe, struct pt_regs *regs)
 	return kasumi_sop_reader_probe_pre(probe, regs);
 }
 
+static void kasumi_sop_evict_trace(void *data, struct inode *inode)
+{
+	/* The enclosing iput/dispose_list guard precedes the cached s_op load.
+	 */
+	(void)data;
+	if (smp_load_acquire(&kasumi_sop_readers_stopping))
+		return;
+	if (inode && !READ_ONCE(inode->i_nlink) && !kasumi_vnode_is_ours(inode))
+		kasumi_identity_source_evict(inode->i_sb->s_dev, inode->i_ino);
+}
+
+static void kasumi_sop_find_evict_tp(struct tracepoint *tp, void *data)
+{
+	struct tracepoint **result = data;
+
+	if (!strcmp(tp->name, "android_vh_evict"))
+		*result = tp;
+}
+
 static int kasumi_sop_shutdown_pre(struct kprobe *probe, struct pt_regs *regs)
 {
 #ifdef CONFIG_ARM64
@@ -575,9 +682,16 @@ static void kasumi_sop_readers_stop(void)
 	unsigned int i;
 
 	mutex_lock(&kasumi_sop_reader_manage_lock);
-	if (kasumi_sop_readers_stopping && !kasumi_sop_reader_registered)
+	if (kasumi_sop_readers_stopping && !kasumi_sop_reader_registered &&
+	    !kasumi_sop_evict_tp_registered)
 		goto reset;
 	WRITE_ONCE(kasumi_sop_readers_stopping, true);
+	if (kasumi_sop_evict_tp_registered) {
+		tracepoint_probe_unregister(
+		    kasumi_sop_evict_tp, (void *)kasumi_sop_evict_trace, NULL);
+		tracepoint_synchronize_unregister();
+		kasumi_sop_evict_tp_registered = false;
+	}
 	for (i = ARRAY_SIZE(kasumi_sop_reader_targets); i--;) {
 		struct kasumi_sop_reader_target *target =
 		    &kasumi_sop_reader_targets[i];
@@ -591,6 +705,7 @@ static void kasumi_sop_readers_stop(void)
 	wait_event(kasumi_sop_wait, !atomic_read(&kasumi_sop_reader_active));
 	kasumi_synchronize_rcu_tasks();
 reset:
+	kasumi_sop_evict_tp = NULL;
 	for (i = 0; i < ARRAY_SIZE(kasumi_sop_reader_targets); ++i) {
 		kasumi_sop_reader_targets[i].probe.addr = NULL;
 		kasumi_sop_reader_targets[i].native = 0;
@@ -610,6 +725,21 @@ static int kasumi_sop_readers_init(void)
 		pr_err("kasumi: refusing unverified VFS reader targets\n");
 		ret = -EOPNOTSUPP;
 		goto fail;
+	}
+	if (!kasumi_sop_reader_targets[KASUMI_SOP_EVICT].probe.addr) {
+		for_each_kernel_tracepoint(kasumi_sop_find_evict_tp,
+					   &kasumi_sop_evict_tp);
+		if (!kasumi_sop_evict_tp) {
+			pr_err(
+			    "kasumi: inlined evict notification unavailable\n");
+			ret = -EOPNOTSUPP;
+			goto fail;
+		}
+		ret = tracepoint_probe_register(
+		    kasumi_sop_evict_tp, (void *)kasumi_sop_evict_trace, NULL);
+		if (ret)
+			goto fail;
+		kasumi_sop_evict_tp_registered = true;
 	}
 	for (i = 0; i < ARRAY_SIZE(kasumi_sop_reader_targets); ++i) {
 		struct kasumi_sop_reader_target *target =
@@ -642,6 +772,9 @@ static int kasumi_sop_readers_init(void)
 	smp_store_release(&kasumi_sop_readers_stopping, false);
 	/* Pre-install callers can only retain the unmodified native vector. */
 	kasumi_synchronize_rcu_tasks();
+	if (kasumi_sop_evict_tp_registered)
+		pr_info("kasumi: guarding inlined VFS evict via iput and "
+			"dispose_list\n");
 	return 0;
 fail:
 	kasumi_sop_readers_stop();
