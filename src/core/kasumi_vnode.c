@@ -668,8 +668,8 @@ static int KASUMI_NOCFI kasumi_vnode_open(struct inode *inode, struct file *file
 	return 0;
 }
 
-/* Transfer an existing exec deny token; pre-open callers have none. */
-static struct file *kasumi_vnode_exec_source(struct file *file, bool denied)
+/* Exec callers acquire their deny-write token after this conversion. */
+struct file *kasumi_vnode_exec_open(struct file *file)
 {
 	struct file *real;
 	int ret = 0;
@@ -698,37 +698,13 @@ static struct file *kasumi_vnode_exec_source(struct file *file, bool denied)
 		ret = -EACCES;
 		goto release;
 	}
-	ret = inode_permission(KVN_SRC_IDMAP(real->f_path.mnt)
-			       file_inode(real), MAY_EXEC);
-	if (!ret && denied) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
-		ret = exe_file_deny_write_access(real);
-#else
-		ret = deny_write_access(real);
-#endif
-	}
+	ret = inode_permission(KVN_SRC_IDMAP(real->f_path.mnt) file_inode(real),
+			       MAY_EXEC);
 	if (!ret)
 		get_file(real);
 release:
-	if (denied) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
-		exe_file_allow_write_access(file);
-#else
-		allow_write_access(file);
-#endif
-	}
 	fput(file);
 	return ret ? ERR_PTR(ret) : real;
-}
-
-struct file *kasumi_vnode_exec_file(struct file *file)
-{
-	return kasumi_vnode_exec_source(file, true);
-}
-
-struct file *kasumi_vnode_exec_open(struct file *file)
-{
-	return kasumi_vnode_exec_source(file, false);
 }
 
 static int KASUMI_NOCFI kasumi_vnode_release(struct inode *inode, struct file *file)

@@ -1,6 +1,9 @@
 #include <linux/fs.h>
 #include <linux/hashtable.h>
+#include <linux/kallsyms.h>
 #include <linux/kprobes.h>
+#include <linux/sizes.h>
+#include <linux/version.h>
 #include <linux/wait.h>
 
 #include "fs/internal.h"
@@ -24,15 +27,12 @@ static atomic_t kasumi_exec_active = ATOMIC_INIT(0);
 static bool kasumi_exec_stopping = true;
 static bool kasumi_exec_registered;
 static struct kprobe kasumi_exec_probe;
-static struct file *(*kasumi_exec_original)(int, struct filename *, int);
+static typeof(do_filp_open) *kasumi_exec_original;
 static void (*kasumi_exec_tasks_barrier)(void);
-static struct file *(*kasumi_exec_open_original)(int, struct filename *,
-						 const struct open_flags *);
-static bool kasumi_exec_open_fallback;
 
 bool kasumi_exec_view_ready(void)
 {
-	return !READ_ONCE(kasumi_exec_stopping);
+	return !smp_load_acquire(&kasumi_exec_stopping);
 }
 
 static bool kasumi_exec_guarded(void)
@@ -55,26 +55,19 @@ static bool kasumi_exec_guarded(void)
 }
 
 static KASUMI_NOCFI struct file *
-kasumi_exec_entry(int fd, struct filename *name, unsigned long argument)
+kasumi_exec_entry(int fd, struct filename *name, const struct open_flags *flags)
 {
-	struct kasumi_exec_guard guard = { .task = current };
-	spinlock_t *lock = &kasumi_exec_guard_locks[
-		hash_min((unsigned long)guard.task, HASH_BITS(kasumi_exec_guards))];
+	struct kasumi_exec_guard guard = {.task = current};
+	spinlock_t *lock = &kasumi_exec_guard_locks[hash_min(
+	    (unsigned long)guard.task, HASH_BITS(kasumi_exec_guards))];
 	struct file *file;
 	unsigned long irqflags;
 
 	spin_lock_irqsave(lock, irqflags);
 	hash_add(kasumi_exec_guards, &guard.node, (unsigned long)current);
 	spin_unlock_irqrestore(lock, irqflags);
-	if (kasumi_exec_open_fallback) {
-		file = kasumi_exec_open_original(fd, name, (void *)argument);
-		/* do_open_execat will acquire the deny token on this source
-		 * file. */
-		file = kasumi_vnode_exec_open(file);
-	} else {
-		file = kasumi_exec_original(fd, name, (int)argument);
-		file = kasumi_vnode_exec_file(file);
-	}
+	file = kasumi_exec_original(fd, name, flags);
+	file = kasumi_vnode_exec_open(file);
 	spin_lock_irqsave(lock, irqflags);
 	hash_del(&guard.node);
 	spin_unlock_irqrestore(lock, irqflags);
@@ -85,29 +78,80 @@ kasumi_exec_entry(int fd, struct filename *name, unsigned long argument)
 
 static int kasumi_exec_pre(struct kprobe *probe, struct pt_regs *regs)
 {
-	(void)probe;
 #ifdef CONFIG_ARM64
-	if (READ_ONCE(kasumi_exec_stopping))
-		return 0;
-	if (kasumi_exec_open_fallback) {
-		const struct open_flags *flags = (void *)regs->regs[2];
+	const struct open_flags *flags = (void *)regs->regs[2];
 
-		if (!flags || !(flags->open_flag & __FMODE_EXEC))
-			return 0;
-	}
+	(void)probe;
+	if (smp_load_acquire(&kasumi_exec_stopping))
+		return 0;
+	if (!flags || !(flags->open_flag & __FMODE_EXEC))
+		return 0;
 	if (kasumi_exec_guarded())
 		return 0;
 	atomic_inc(&kasumi_exec_active);
 	instruction_pointer_set(regs, (unsigned long)kasumi_exec_entry);
 	return 1;
 #else
+	(void)probe;
+	(void)regs;
 	return 0;
 #endif
 }
 
+struct kasumi_exec_symbol {
+	unsigned long address;
+	bool ambiguous;
+};
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+static int kasumi_exec_collect_symbol(void *data, const char *name,
+				      unsigned long address)
+#else
+static int kasumi_exec_collect_symbol(void *data, const char *name,
+				      struct module *module,
+				      unsigned long address)
+#endif
+{
+	struct kasumi_exec_symbol *symbol = data;
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+	if (module)
+		return 0;
+#endif
+	if (strcmp(name, "do_filp_open"))
+		return 0;
+	if (symbol->address && symbol->address != address)
+		symbol->ambiguous = true;
+	symbol->address = address;
+	return 0;
+}
+
+static KASUMI_NOCFI unsigned long kasumi_exec_resolve(void)
+{
+	typeof(kallsyms_on_each_symbol) *each_symbol =
+	    (void *)kasumi_lookup_callable_quiet("kallsyms_on_each_symbol");
+	typeof(kallsyms_lookup) *lookup =
+	    (void *)kasumi_lookup_callable_quiet("kallsyms_lookup");
+	struct kasumi_exec_symbol target = {};
+	unsigned long size, offset;
+	char buffer[KSYM_NAME_LEN];
+	char *module = NULL;
+	const char *name;
+
+	if (!each_symbol || !lookup ||
+	    each_symbol(kasumi_exec_collect_symbol, &target) ||
+	    target.ambiguous || !target.address || (target.address & 3))
+		return 0;
+	name = lookup(target.address, &size, &offset, &module, buffer);
+	if (!name || module || offset || strcmp(name, "do_filp_open") ||
+	    size < sizeof(u32) || size > SZ_16K || (size & 3))
+		return 0;
+	return target.address;
+}
+
 KASUMI_NOCFI void kasumi_exec_view_stop(void)
 {
-	WRITE_ONCE(kasumi_exec_stopping, true);
+	smp_store_release(&kasumi_exec_stopping, true);
 	if (kasumi_exec_registered) {
 		unregister_kprobe(&kasumi_exec_probe);
 		kasumi_exec_registered = false;
@@ -115,36 +159,56 @@ KASUMI_NOCFI void kasumi_exec_view_stop(void)
 	wait_event(kasumi_exec_wait, !atomic_read(&kasumi_exec_active));
 	if (kasumi_exec_tasks_barrier)
 		kasumi_exec_tasks_barrier();
+	kasumi_exec_original = NULL;
+	kasumi_exec_tasks_barrier = NULL;
+	kasumi_exec_probe.addr = NULL;
 }
 
 int kasumi_exec_view_init(void)
 {
+	unsigned long address;
 	int ret;
 
-	if (!READ_ONCE(kasumi_exec_stopping))
+	if (kasumi_exec_view_ready())
 		return 0;
 #ifndef CONFIG_ARM64
 	return -EOPNOTSUPP;
 #endif
-	kasumi_exec_original = (void *)kasumi_lookup_callable_quiet("do_open_execat");
+	address = kasumi_exec_resolve();
+	if (!address) {
+		pr_err("kasumi: unverified VFS exec entry: do_filp_open\n");
+		ret = -EOPNOTSUPP;
+		goto fail;
+	}
 	kasumi_exec_tasks_barrier =
-		(void *)kasumi_lookup_callable_quiet("synchronize_rcu_tasks");
-	kasumi_exec_open_fallback = !kasumi_exec_original;
-	if (kasumi_exec_open_fallback)
-		kasumi_exec_open_original =
-		    (void *)kasumi_lookup_callable_quiet("do_filp_open");
-	if ((!kasumi_exec_original && !kasumi_exec_open_original) ||
-	    !kasumi_exec_tasks_barrier)
-		return -EOPNOTSUPP;
-	kasumi_exec_probe.addr = (void *)kasumi_lookup_name_quiet(
-	    kasumi_exec_open_fallback ? "do_filp_open" : "do_open_execat");
+	    (void *)kasumi_lookup_callable_quiet("synchronize_rcu_tasks");
+	if (!kasumi_exec_tasks_barrier) {
+		pr_err("kasumi: exec reader barrier unavailable\n");
+		ret = -EOPNOTSUPP;
+		goto fail;
+	}
+	kasumi_exec_probe.addr = (void *)address;
+	kasumi_exec_probe.flags = KPROBE_FLAG_DISABLED;
 	kasumi_exec_probe.pre_handler = kasumi_exec_pre;
 	ret = register_kprobe(&kasumi_exec_probe);
 	if (ret)
-		return ret;
+		goto fail;
 	kasumi_exec_registered = true;
-	WRITE_ONCE(kasumi_exec_stopping, false);
+	if ((unsigned long)kasumi_exec_probe.addr != address) {
+		pr_err("kasumi: VFS exec probe moved: do_filp_open\n");
+		ret = -EOPNOTSUPP;
+		goto fail;
+	}
+	kasumi_exec_original = (void *)kasumi_exec_probe.addr;
+	ret = enable_kprobe(&kasumi_exec_probe);
+	if (ret)
+		goto fail;
+	smp_store_release(&kasumi_exec_stopping, false);
+	pr_info("kasumi: source exec bridge via do_filp_open\n");
 	return 0;
+fail:
+	kasumi_exec_view_stop();
+	return ret;
 }
 
 void kasumi_exec_view_exit(void)

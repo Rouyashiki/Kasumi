@@ -111,8 +111,7 @@ void kasumi_vnode_aio_exit(void);
 int kasumi_vnode_source_path(const struct dentry *dentry, struct path *source);
 int kasumi_vnode_refresh_label(const struct dentry *dentry);
 
-/* Consumes one opened exec file reference and its native deny-write token. */
-struct file *kasumi_vnode_exec_file(struct file *file);
+/* Consumes one opened file reference before the caller denies writes. */
 struct file *kasumi_vnode_exec_open(struct file *file);
 
 /* Read current source capabilities in sleepable context. */
