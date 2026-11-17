@@ -111,12 +111,11 @@ void kasumi_vnode_aio_exit(void);
 int kasumi_vnode_source_path(const struct dentry *dentry, struct path *source);
 int kasumi_vnode_refresh_label(const struct dentry *dentry);
 
-/* Consumes one opened file reference before the caller denies writes. */
+/* Check visible/source exec restrictions; consumes the file on error. */
 struct file *kasumi_vnode_exec_open(struct file *file);
 
-/* Read current source capabilities in sleepable context. */
-int kasumi_vnode_read_caps(const struct dentry *dentry,
-			   struct cpu_vfs_cap_data *out, bool *handled);
+/* Borrowed until the caller releases the input dentry; safe in a kprobe. */
+const struct path *kasumi_vnode_caps_source(const struct dentry *dentry);
 
 /*
  * Release the i_private state of a virtual inode.  Called from the hijacked

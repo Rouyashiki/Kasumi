@@ -41,7 +41,7 @@ mount 投影使用被观察进程自己的 namespace 与 root。共享缓存保�
 
 源目录中的普通子项通过原生加锁前的 syscall adapter 支持 rename。重命名及交换会保留可见 dentry，使 cwd 与已打开目录的路径跟随新名字。投影目录与原生目录之间的移动返回 `EXDEV`。精确单文件别名返回 `EXDEV`，其配置路径绑定需要显式更新规则。无后端源的虚拟目录保持只读。旧 mmap ABI 沿用原生 source-file identity。规则持有的 identity domain 使已观察子项在 dentry 回收、硬链接及 casefold 别名之间保持 inode 编号。源对象 unlink 后的 eviction 与 superblock shutdown 撤销对应身份，已持有的引用继续保留旧编号。Kasumi 分配的 inode 编号在活跃 registry 内唯一，可见文件系统也可能在同一数值区间分配原生 inode。
 
-`KSM_CAP_SOURCE_XATTR` 表示源对象 get/list/set/remove xattr 委托全部可用。操作遵循可见对象和源对象的权限检查、源挂载 idmap 与写引用。可见挂载的只读限制由原生 VFS 检查。exec 将真实源 file 交给 binfmt，以保持写入互斥和源能力读取，其 executable identity 随源 file。native create 成功后的 SELinux context 复制仍可能失败。
+`KSM_CAP_SOURCE_XATTR` 表示源对象 get/list/set/remove xattr 委托全部可用。操作遵循可见对象和源对象的权限检查、源挂载 idmap 与写引用。可见挂载的只读限制由原生 VFS 检查。exec 保留可见 file 供 binfmt 和凭据检查使用，包括可见挂载的 `nosuid` 限制。执行打开涉及 idmapped 可见挂载或源挂载时返回 `EOPNOTSUPP`，因为 vnode 的所有者属性无法表达每个挂载独立的 set-ID 映射；普通文件访问仍可用。源文件的防写保护持续到可见执行文件的最后一个引用释放；源对象权限、`noexec` 限制及文件能力仍然生效。native create 成功后的 SELinux context 复制仍可能失败。
 
 `KSM_CAP_SOURCE_LOCKS` 与 `KSM_CAP_SOURCE_LEASES` 表示支持源对象的 POSIX/OFD/flock 和 lease 所有权。直接访问源路径与别名共享源锁域。owner、signal 和 fasync 操作作用于源 file，并处理加锁与关闭 FD 的竞态清理。
 

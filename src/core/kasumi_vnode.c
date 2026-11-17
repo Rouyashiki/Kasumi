@@ -84,6 +84,8 @@ static const struct file_operations kasumi_vnode_dir_fops;
 static const struct file_operations kasumi_vnode_special_fops;
 
 static void kasumi_vnode_copyattr(struct inode *inode, struct inode *source);
+static void kasumi_vnode_copyattr_locked(struct inode *inode, struct inode *source);
+static void kasumi_vnode_copyattr_exec(struct inode *inode, struct inode *source);
 static int kasumi_vnode_clone_sid(struct inode *vnode, struct inode *source);
 static struct inode *kasumi_vnode_allocate(struct super_block *sb,
 	struct kasumi_inode_identity *identity);
@@ -171,20 +173,24 @@ bool kasumi_vnode_is_ours(const struct inode *inode)
 	       iop == &kasumi_vnode_dir_iops;
 }
 
-int kasumi_vnode_read_caps(const struct dentry *dentry,
-			   struct cpu_vfs_cap_data *out, bool *handled)
+const struct path *kasumi_vnode_caps_source(const struct dentry *dentry)
 {
-	struct inode *inode = dentry ? d_inode(dentry) : NULL;
+	const struct path *source = NULL;
+	struct inode *inode;
 	struct kasumi_vnode_info *info;
 
-	*handled = false;
-	if (!inode || !kasumi_vnode_is_ours(inode))
-		return 0;
-	info = inode->i_private;
-	if (!info || !info->source.dentry)
-		return 0;
-	*handled = true;
-	return kasumi_source_vfs_caps(&info->source, out);
+	/* The caller's dentry reference pins every immutable source path. */
+	while (dentry && (inode = d_inode(dentry)) &&
+	       kasumi_vnode_is_ours(inode)) {
+		info = inode->i_private;
+		if (!info || !info->source.dentry)
+			return ERR_PTR(-ENODATA);
+		if (!info->source.mnt)
+			return ERR_PTR(-EIO);
+		source = &info->source;
+		dentry = source->dentry;
+	}
+	return source;
 }
 
 void kasumi_vnode_free_info(struct inode *inode)
@@ -433,7 +439,7 @@ static int KASUMI_NOCFI kasumi_vnode_setattr(KVN_IDMAP_ARG struct dentry *dentry
 	ret = kasumi_notify_change(KVN_SRC_IDMAP(info->source.mnt)
 				   src_dentry, &sattr, NULL);
 	if (!ret)
-		kasumi_vnode_copyattr(vi, src_inode);
+		kasumi_vnode_copyattr_locked(vi, src_inode);
 	inode_unlock(src_inode);
 	module_put(THIS_MODULE);
 	return ret;
@@ -625,16 +631,34 @@ static void kasumi_vnode_notify_close(struct inode *inode)
 	mutex_unlock(&info->io_notify_lock);
 }
 
+/* Raw vnode IDs cannot carry a mount-specific set-ID mapping. */
+static bool kasumi_vnode_exec_idmap_supported(const struct path *visible,
+					    const struct path *source)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+	return mnt_idmap(visible->mnt) == &nop_mnt_idmap &&
+	       mnt_idmap(source->mnt) == &nop_mnt_idmap;
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+	return mnt_user_ns(visible->mnt) == &init_user_ns &&
+	       mnt_user_ns(source->mnt) == &init_user_ns;
+#else
+	return true;
+#endif
+}
+
 static int KASUMI_NOCFI kasumi_vnode_open(struct inode *inode, struct file *file)
 {
 	struct kasumi_vnode_info *info = inode->i_private;
 	struct file *real_file;
 	int ret;
 
-	if ((file->f_mode & FMODE_EXEC) && !kasumi_exec_view_ready())
+	if ((file->f_flags & __FMODE_EXEC) && !kasumi_exec_view_ready())
 		return -EOPNOTSUPP;
 	if (!info || !info->source.dentry)
 		return -ENODEV;
+	if ((file->f_flags & __FMODE_EXEC) &&
+	    !kasumi_vnode_exec_idmap_supported(&file->f_path, &info->source))
+		return -EOPNOTSUPP;
 	if ((S_ISCHR(info->special_mode) || S_ISBLK(info->special_mode)) &&
 	    ((info->source.mnt->mnt_flags & MNT_NODEV) ||
 	     (info->source.mnt->mnt_sb->s_iflags & SB_I_NODEV)))
@@ -654,21 +678,28 @@ static int KASUMI_NOCFI kasumi_vnode_open(struct inode *inode, struct file *file
 	if (IS_ERR(real_file))
 		return PTR_ERR(real_file);
 	ret = kasumi_vnode_select_fops(file, real_file, info->special_mode != 0);
+	/* file_clone_open() reaches this callback without do_filp_open(). */
+	if (!ret && (file->f_flags & __FMODE_EXEC))
+		ret = kasumi_exec_file_hold(file, real_file);
 	if (!ret)
 		ret = kasumi_vnode_notify_open(inode);
 	if (ret) {
+		kasumi_exec_file_release(file);
 		fput(real_file);
 		return ret;
 	}
 	file->private_data = real_file;
 	file->f_mapping = real_file->f_mapping;
 	kasumi_vnode_copy_modes(file, real_file);
-	kasumi_vnode_copyattr(inode, file_inode(real_file));
+	if (file->f_flags & __FMODE_EXEC)
+		kasumi_vnode_copyattr_exec(inode, file_inode(real_file));
+	else
+		kasumi_vnode_copyattr(inode, file_inode(real_file));
 	kasumi_file_lock_opened();
 	return 0;
 }
 
-/* Exec callers acquire their deny-write token after this conversion. */
+/* Validate exec restrictions without replacing the visible file. */
 struct file *kasumi_vnode_exec_open(struct file *file)
 {
 	struct file *real;
@@ -701,10 +732,10 @@ struct file *kasumi_vnode_exec_open(struct file *file)
 	ret = inode_permission(KVN_SRC_IDMAP(real->f_path.mnt) file_inode(real),
 			       MAY_EXEC);
 	if (!ret)
-		get_file(real);
+		return file;
 release:
 	fput(file);
-	return ret ? ERR_PTR(ret) : real;
+	return ERR_PTR(ret);
 }
 
 static int KASUMI_NOCFI kasumi_vnode_release(struct inode *inode, struct file *file)
@@ -714,6 +745,7 @@ static int KASUMI_NOCFI kasumi_vnode_release(struct inode *inode, struct file *f
 	if (S_ISDIR(inode->i_mode))
 		kasumi_dir_view_release(file);
 	if (real_file) {
+		kasumi_exec_file_release(file);
 		kasumi_vnode_notify_close(inode);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 		/* The outer __fput already provides a sleepable release context.
@@ -795,7 +827,8 @@ static void kasumi_vnode_aio_complete(struct kiocb *iocb, long result
 #endif
 );
 
-static void kasumi_vnode_copyattr(struct inode *inode, struct inode *source)
+/* Caller holds the visible i_rwsem exclusively and the source i_rwsem. */
+static void kasumi_vnode_copyattr_locked(struct inode *inode, struct inode *source)
 {
 	struct kasumi_vnode_info *info = inode->i_private;
 
@@ -807,6 +840,28 @@ static void kasumi_vnode_copyattr(struct inode *inode, struct inode *source)
 	i_size_write(inode, i_size_read(source));
 	inode->i_blocks = READ_ONCE(source->i_blocks);
 	spin_unlock(&inode->i_lock);
+}
+
+static void kasumi_vnode_copyattr(struct inode *inode, struct inode *source)
+{
+	/* Attribute refresh is optional; NOWAIT I/O must not wait on these locks. */
+	if (!inode_trylock(inode))
+		return;
+	if (inode_trylock_shared(source)) {
+		kasumi_vnode_copyattr_locked(inode, source);
+		inode_unlock_shared(source);
+	}
+	inode_unlock(inode);
+}
+
+static void kasumi_vnode_copyattr_exec(struct inode *inode, struct inode *source)
+{
+	/* Serialize the set-ID tuple with source chown and native bprm_fill_uid. */
+	inode_lock(inode);
+	inode_lock_shared_nested(source, I_MUTEX_NONDIR2);
+	kasumi_vnode_copyattr_locked(inode, source);
+	inode_unlock_shared(source);
+	inode_unlock(inode);
 }
 
 static void kasumi_vnode_aio_put(struct kasumi_vnode_aio *request)
@@ -2187,7 +2242,7 @@ static struct dentry *kasumi_vnode_src_begin(struct kasumi_vnode_info *info,
 static void kasumi_vnode_src_end(struct kasumi_vnode_info *info,
 				 struct inode *src_dir, struct dentry *child)
 {
-	kasumi_vnode_copyattr(info->inode, src_dir);
+	kasumi_vnode_copyattr_locked(info->inode, src_dir);
 	inode_unlock(src_dir);
 	kasumi_vnode_src_drop_write(&info->source);
 	if (child)
