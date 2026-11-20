@@ -90,6 +90,7 @@ kasumi-iget5-locked-rcu := $(shell grep -E '^[[:space:]]*(extern[[:space:]]+)?st
 ifneq ($(kasumi-iget5-locked-rcu),)
 CFLAGS_core/kasumi_sop_shadow.o += -DKASUMI_HAS_IGET5_LOCKED_RCU
 endif
+CFLAGS_core/kasumi_vnode_handle.o += -I$(srctree)
 CFLAGS_hooks/kasumi_proc_seq.o += -I$(srctree)
 CFLAGS_features/kasumi_exec_view.o += -I$(srctree)
 CFLAGS_features/kasumi_vfs_view.o += -I$(srctree)

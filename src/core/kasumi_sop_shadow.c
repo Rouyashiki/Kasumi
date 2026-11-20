@@ -17,6 +17,7 @@
 #include "kasumi_sop_shadow.h"
 #include "kasumi_dirhijack.h"
 #include "kasumi_runtime.h"
+#include "kasumi_symbol.h"
 #include "kasumi_vnode.h"
 #include "kasumi_identity.h"
 
@@ -29,7 +30,6 @@
 #include <linux/mutex.h>
 #include <linux/rcupdate.h>
 #include <linux/slab.h>
-#include <linux/sizes.h>
 #include <linux/spinlock.h>
 #include <linux/srcu.h>
 #include <linux/tracepoint.h>
@@ -390,12 +390,6 @@ static KASUMI_NOCFI void kasumi_sop_dispose_entry(struct list_head *head)
 	kasumi_sop_reader_leave(&guard);
 }
 
-struct kasumi_sop_symbol_ops {
-	const char *(*lookup)(unsigned long, unsigned long *, unsigned long *,
-			      char **, char *);
-	long (*read_code)(void *, const void *, size_t);
-};
-
 struct kasumi_sop_reader_symbols {
 	unsigned long addresses[ARRAY_SIZE(kasumi_sop_reader_names)];
 	bool ambiguous[ARRAY_SIZE(kasumi_sop_reader_names)];
@@ -437,47 +431,8 @@ static int kasumi_sop_collect_symbol(void *data, const char *name,
 	return 0;
 }
 
-static KASUMI_NOCFI unsigned long
-kasumi_sop_core_entry(const struct kasumi_sop_symbol_ops *ops,
-		      unsigned long address, const char *name)
-{
-	unsigned long size, offset;
-	char buffer[KSYM_NAME_LEN];
-	char *module = NULL;
-	const char *symbol;
-
-	if (!address || (address & 3))
-		return 0;
-	symbol = ops->lookup(address, &size, &offset, &module, buffer);
-	if (!symbol || module || offset || strcmp(symbol, name) ||
-	    size < sizeof(u32) || size > SZ_16K || (size & 3))
-		return 0;
-	return size;
-}
-
 static KASUMI_NOCFI bool
-kasumi_sop_calls(const struct kasumi_sop_symbol_ops *ops, unsigned long caller,
-		 unsigned long size, unsigned long callee)
-{
-	unsigned long offset;
-	u32 instruction;
-
-	for (offset = 0; offset < size; offset += sizeof(instruction)) {
-		if (ops->read_code(&instruction, (void *)(caller + offset),
-				   sizeof(instruction)))
-			return false;
-		instruction = le32_to_cpu(instruction);
-		if ((instruction & 0x7c000000U) == 0x14000000U &&
-		    caller + offset +
-			    sign_extend64(instruction & 0x03ffffffU, 25) * 4 ==
-			callee)
-			return true;
-	}
-	return false;
-}
-
-static KASUMI_NOCFI bool
-kasumi_sop_dispose_validate(const struct kasumi_sop_symbol_ops *ops,
+kasumi_sop_dispose_validate(const struct kasumi_symbol_ops *ops,
 			    const struct kasumi_sop_reader_symbols *symbols)
 {
 	unsigned long dispose = symbols->addresses[KASUMI_SOP_DISPOSE_LIST];
@@ -486,11 +441,11 @@ kasumi_sop_dispose_validate(const struct kasumi_sop_symbol_ops *ops,
 	/* Every batch eviction path must still reach the guarded local list. */
 	for (i = 0; i < ARRAY_SIZE(kasumi_sop_dispose_callers); ++i) {
 		unsigned long caller = symbols->dispose_callers[i];
-		unsigned long size = kasumi_sop_core_entry(
+		unsigned long size = kasumi_core_symbol_size(
 		    ops, caller, kasumi_sop_dispose_callers[i]);
 
 		if (symbols->dispose_ambiguous[i] || !size ||
-		    !kasumi_sop_calls(ops, caller, size, dispose)) {
+		    !kasumi_arm64_calls(ops, caller, size, dispose)) {
 			pr_err("kasumi: unverified VFS disposal caller: %s\n",
 			       kasumi_sop_dispose_callers[i]);
 			return false;
@@ -500,7 +455,7 @@ kasumi_sop_dispose_validate(const struct kasumi_sop_symbol_ops *ops,
 }
 
 struct kasumi_sop_allocator_search {
-	const struct kasumi_sop_symbol_ops *ops;
+	const struct kasumi_symbol_ops *ops;
 	unsigned long sizes[KASUMI_SOP_EVICT];
 	unsigned long address;
 	bool ambiguous;
@@ -523,7 +478,7 @@ static int kasumi_sop_collect_allocator(void *data, const char *name,
 		return 0;
 #endif
 	if (strcmp(name, "alloc_inode") ||
-	    !kasumi_sop_core_entry(search->ops, address, name))
+	    !kasumi_core_symbol_size(search->ops, address, name))
 		return 0;
 	/* IncFS's allocator is reached through s_op, never by a VFS direct
 	 * call. */
@@ -531,7 +486,7 @@ static int kasumi_sop_collect_allocator(void *data, const char *name,
 		unsigned long caller =
 		    (unsigned long)kasumi_sop_reader_targets[i].probe.addr;
 
-		if (!kasumi_sop_calls(search->ops, caller, search->sizes[i],
+		if (!kasumi_arm64_calls(search->ops, caller, search->sizes[i],
 				      address))
 			continue;
 		if (search->address && search->address != address)
@@ -546,7 +501,7 @@ static KASUMI_NOCFI bool kasumi_sop_reader_targets_prepare(void)
 {
 	typeof(kallsyms_on_each_symbol) *each_symbol =
 	    (void *)kasumi_lookup_callable_quiet("kallsyms_on_each_symbol");
-	struct kasumi_sop_symbol_ops ops = {
+	struct kasumi_symbol_ops ops = {
 	    .lookup = (void *)kasumi_lookup_callable_quiet("kallsyms_lookup"),
 	};
 	struct kasumi_sop_reader_symbols symbols = {};
@@ -579,7 +534,7 @@ static KASUMI_NOCFI bool kasumi_sop_reader_targets_prepare(void)
 		if (i == KASUMI_SOP_IGET5_LOCKED_RCU && !address)
 			continue;
 #endif
-		size = kasumi_sop_core_entry(&ops, address,
+		size = kasumi_core_symbol_size(&ops, address,
 					     kasumi_sop_reader_names[i]);
 		if (symbols.ambiguous[i] || !size) {
 			pr_err("kasumi: unverified VFS reader entry: %s\n",
