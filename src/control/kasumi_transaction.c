@@ -1,5 +1,4 @@
 #include <linux/err.h>
-#include <linux/hashtable.h>
 #include <linux/limits.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
@@ -26,8 +25,6 @@ struct kasumi_staged_rule {
 };
 
 struct kasumi_transaction_state {
-	struct hlist_node node;
-	const struct file *file;
 	struct kasumi_transaction status;
 	struct list_head rules;
 	size_t bytes;
@@ -35,21 +32,7 @@ struct kasumi_transaction_state {
 	size_t configuration_bytes;
 };
 
-static DEFINE_HASHTABLE(kasumi_transactions, 8);
 static u64 kasumi_transaction_next_id;
-
-static struct kasumi_transaction_state *
-kasumi_transaction_find(const struct file *file)
-{
-	struct kasumi_transaction_state *state;
-
-	hash_for_each_possible(kasumi_transactions, state, node,
-			       (unsigned long)file) {
-		if (state->file == file)
-			return state;
-	}
-	return NULL;
-}
 
 static void kasumi_transaction_configuration_free(
 	struct kasumi_transaction_state *state)
@@ -62,14 +45,14 @@ static void kasumi_transaction_configuration_free(
 	state->configuration_bytes = 0;
 }
 
-static int kasumi_transaction_stage_configuration(const struct file *file,
-						 void __user *argument)
+static int
+kasumi_transaction_stage_configuration(struct kasumi_transaction_state *state,
+				       void __user *argument)
 {
 	struct kasumi_transaction_configuration request;
 	struct kasumi_batch_configuration configuration = {};
 	struct kasumi_transaction_maps_rule *maps = NULL;
 	struct kasumi_transaction_kstat_rule *kstats = NULL;
-	struct kasumi_transaction_state *state;
 	u32 *allow = NULL, *deny = NULL;
 	size_t bytes = 0, previous_bytes;
 	u32 index;
@@ -84,7 +67,6 @@ static int kasumi_transaction_stage_configuration(const struct file *file,
 	    request.reserved1 || request.reserved2 ||
 	    request.reserved[0] || request.reserved[1])
 		return -EINVAL;
-	state = kasumi_transaction_find(file);
 	if (!state || state->status.id != request.id)
 		return -ESTALE;
 	if (state->status.state != KSM_TX_STATE_STAGING)
@@ -219,11 +201,11 @@ static int kasumi_transaction_result(void __user *argument,
 	return result;
 }
 
-static int kasumi_transaction_begin(const struct file *file,
-				   struct kasumi_transaction *request,
-				   void __user *argument)
+static int kasumi_transaction_begin(struct kasumi_transaction_state **slot,
+				    struct kasumi_transaction *request,
+				    void __user *argument)
 {
-	struct kasumi_transaction_state *state = kasumi_transaction_find(file);
+	struct kasumi_transaction_state *state = *slot;
 	u64 generation = kasumi_rules_generation();
 
 	if ((request->flags & ~(KSM_TX_REPLACE_PATH_RULES |
@@ -244,9 +226,8 @@ static int kasumi_transaction_begin(const struct file *file,
 		state = kzalloc(sizeof(*state), GFP_KERNEL);
 		if (!state)
 			return -ENOMEM;
-		state->file = file;
 		INIT_LIST_HEAD(&state->rules);
-		hash_add(kasumi_transactions, &state->node, (unsigned long)file);
+		*slot = state;
 	}
 	kasumi_staged_rules_free(&state->rules);
 	kasumi_transaction_configuration_free(state);
@@ -330,11 +311,11 @@ fail:
 	return ERR_PTR(error);
 }
 
-static int kasumi_transaction_stage(const struct file *file, void __user *argument)
+static int kasumi_transaction_stage(struct kasumi_transaction_state *state,
+				    void __user *argument)
 {
 	struct kasumi_transaction_stage request;
 	struct kasumi_transaction_rule *rules;
-	struct kasumi_transaction_state *state;
 	LIST_HEAD(staged);
 	size_t bytes = 0;
 	u32 index;
@@ -345,7 +326,6 @@ static int kasumi_transaction_stage(const struct file *file, void __user *argume
 	if (request.size != sizeof(request) || !request.count ||
 	    request.count > KSM_TX_MAX_STAGE)
 		return -EINVAL;
-	state = kasumi_transaction_find(file);
 	if (!state || request.id != state->status.id)
 		return -ESTALE;
 	if (state->status.state != KSM_TX_STATE_STAGING)
@@ -471,11 +451,11 @@ bool kasumi_ioctl_changes_rules(unsigned int command)
 	}
 }
 
-long kasumi_transaction_ioctl(const struct file *file, unsigned int command,
-			      void __user *argument)
+long kasumi_transaction_ioctl(struct kasumi_transaction_state **slot,
+			      unsigned int command, void __user *argument)
 {
 	struct kasumi_transaction request;
-	struct kasumi_transaction_state *state;
+	struct kasumi_transaction_state *state = *slot;
 	int result = 0;
 
 	if (command == KSM_IOC_GET_CAPABILITIES) {
@@ -527,16 +507,15 @@ long kasumi_transaction_ioctl(const struct file *file, unsigned int command,
 		       -EFAULT : 0;
 	}
 	if (command == KSM_IOC_STAGE_TRANSACTION)
-		return kasumi_transaction_stage(file, argument);
+		return kasumi_transaction_stage(state, argument);
 	if (command == KSM_IOC_STAGE_CONFIGURATION)
-		return kasumi_transaction_stage_configuration(file, argument);
+		return kasumi_transaction_stage_configuration(state, argument);
 	if (copy_from_user(&request, argument, sizeof(request)))
 		return -EFAULT;
 	if (request.size != sizeof(request))
 		return -EINVAL;
 	if (command == KSM_IOC_BEGIN_TRANSACTION)
-		return kasumi_transaction_begin(file, &request, argument);
-	state = kasumi_transaction_find(file);
+		return kasumi_transaction_begin(slot, &request, argument);
 	if (!state || (request.id && request.id != state->status.id))
 		return -ESTALE;
 	if (command != KSM_IOC_QUERY_TRANSACTION && !request.id)
@@ -564,17 +543,12 @@ long kasumi_transaction_ioctl(const struct file *file, unsigned int command,
 	return kasumi_transaction_result(argument, state, result);
 }
 
-void kasumi_transaction_release(const struct file *file)
+void kasumi_transaction_release(struct kasumi_transaction_state *state)
 {
-	struct kasumi_transaction_state *state;
-
-	mutex_lock(&kasumi_mutation_mutex);
-	state = kasumi_transaction_find(file);
-	if (state) {
-		hash_del(&state->node);
-		kasumi_staged_rules_free(&state->rules);
-		kasumi_transaction_configuration_free(state);
-		kfree(state);
-	}
-	mutex_unlock(&kasumi_mutation_mutex);
+	if (!state)
+		return;
+	/* Final fput runs after all ioctls on this open file have returned. */
+	kasumi_staged_rules_free(&state->rules);
+	kasumi_transaction_configuration_free(state);
+	kfree(state);
 }

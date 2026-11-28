@@ -711,13 +711,6 @@ static KASUMI_NOCFI int kasumi_dispatch_cmd(unsigned int cmd, void __user *arg)
 		return 0;
 	}
 
-	if (cmd == KSM_IOC_GET_VERSION) {
-		int ver = KSM_PROTOCOL_VERSION;
-		if (copy_to_user(arg, &ver, sizeof(ver)))
-			return -EFAULT;
-		return 0;
-	}
-
 	if (cmd == KSM_IOC_SET_POLICY)
 		return kasumi_ioctl_set_policy(arg);
 	if (cmd == KSM_IOC_GET_POLICY)
@@ -1747,18 +1740,22 @@ static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
 
 	if (cmd == KSM_IOC_GET_CONFLICTS || cmd == KSM_IOC_ACK_CONFLICTS)
 		return kasumi_conflict_ioctl(cmd, (void __user *)arg);
+	if (cmd == KSM_IOC_GET_VERSION)
+		return put_user(KSM_PROTOCOL_VERSION, (int __user *)arg);
 
 	mutex_lock(&kasumi_mutation_mutex);
 	atomic_long_set(&kasumi_ioctl_tgid, (long)task_tgid_vnr(current));
 	generation = kasumi_rules_generation();
-	if (!kasumi_control_accepting() && cmd != KSM_IOC_GET_VERSION &&
-	    cmd != KSM_IOC_GET_FEATURES && cmd != KSM_IOC_PREPARE_UNLOAD &&
-	    cmd != KSM_IOC_WATCH_INSTANCE) {
+	if (!kasumi_control_accepting() && cmd != KSM_IOC_GET_FEATURES &&
+	    cmd != KSM_IOC_PREPARE_UNLOAD && cmd != KSM_IOC_WATCH_INSTANCE) {
 		ret = -ESHUTDOWN;
 		goto out;
 	}
 	if (kasumi_transaction_command(cmd)) {
-		ret = kasumi_transaction_ioctl(file, cmd, (void __user *)arg);
+		struct kasumi_transaction_state *state = file->private_data;
+
+		ret = kasumi_transaction_ioctl(&state, cmd, (void __user *)arg);
+		file->private_data = state;
 		goto out;
 	}
 	switch (cmd) {
@@ -1772,7 +1769,6 @@ static KASUMI_NOCFI long kasumi_dev_ioctl(struct file *file, unsigned int cmd,
 	case KSM_IOC_USER_HIDE_CLEAR:
 		ret = kasumi_hide_rules_ioctl(cmd, (void __user *)arg);
 		break;
-	case KSM_IOC_GET_VERSION:
 	case KSM_IOC_SET_ENABLED:
 	case KSM_IOC_ADD_RULE:
 	case KSM_IOC_DEL_RULE:
@@ -1827,7 +1823,7 @@ out:
 static int kasumi_anon_release(struct inode *inode, struct file *file)
 {
 	(void)inode;
-	kasumi_transaction_release(file);
+	kasumi_transaction_release(file->private_data);
 	if (atomic_dec_and_test(&kasumi_control_files))
 		WRITE_ONCE(kasumi_daemon_pid, 0);
 	return 0;

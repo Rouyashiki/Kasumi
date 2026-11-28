@@ -33,7 +33,7 @@ struct kasumi_batch {
 
 static struct task_struct *kasumi_batch_owner;
 static struct kasumi_batch *kasumi_current_batch;
-static struct kasumi_batch __rcu *kasumi_pending_batch;
+static struct kasumi_batch __rcu *kasumi_publishing_batch;
 
 static struct kasumi_view_settings kasumi_config_settings(void)
 {
@@ -42,8 +42,9 @@ static struct kasumi_view_settings kasumi_config_settings(void)
 	u64 generation;
 
 	rcu_read_lock();
-	batch = rcu_dereference(kasumi_pending_batch);
 	generation = kasumi_rules_generation();
+	/* Clearing the pointer also publishes the scalar settings below. */
+	batch = unrcu_pointer(smp_load_acquire(&kasumi_publishing_batch));
 	if (batch) {
 		settings = generation >= batch->generation ?
 			   batch->settings : batch->previous_settings;
@@ -155,7 +156,6 @@ struct kasumi_batch *kasumi_batch_begin(void)
 	}
 	kasumi_current_batch = batch;
 	WRITE_ONCE(kasumi_batch_owner, current);
-	rcu_assign_pointer(kasumi_pending_batch, batch);
 	return batch;
 }
 
@@ -356,8 +356,10 @@ void kasumi_batch_finish(struct kasumi_batch *batch, bool publish)
 {
 	struct kasumi_rule_lifetime *life, *next;
 
-	if (publish)
+	if (publish) {
+		rcu_assign_pointer(kasumi_publishing_batch, batch);
 		kasumi_rules_publish(batch->generation);
+	}
 	kasumi_dirhijack_batch_finish(batch->directories, publish);
 	/* A reader retaining the previous generation must finish first. */
 	synchronize_rcu();
@@ -370,8 +372,8 @@ void kasumi_batch_finish(struct kasumi_batch *batch, bool publish)
 		WRITE_ONCE(kasumi_stealth_enabled, batch->settings.stealth);
 		WRITE_ONCE(kasumi_debug_enabled, batch->settings.debug);
 		smp_store_release(&kasumi_enabled, batch->settings.enabled);
+		smp_store_release(&kasumi_publishing_batch, NULL);
 	}
-	rcu_assign_pointer(kasumi_pending_batch, NULL);
 	mutex_lock(&kasumi_config_mutex);
 	list_for_each_entry_safe(life, next, &batch->changes, batch_node) {
 		bool retire = publish ?
