@@ -81,6 +81,10 @@ CFLAGS_core/kasumi_vnode.o += $(kasumi-rwsem-compat-cflags)
 # Applying the same names here makes the kernel declarations check our ABI.
 CFLAGS_core/kasumi_rwsem_compat.o += $(kasumi-rwsem-compat-cflags)
 
+ifneq ($(shell grep -w 'backing_file_real_path' $(srctree)/include/linux/fs.h),)
+CFLAGS_core/kasumi_vnode.o += -DKASUMI_BACKING_FILE_HAS_REAL_PATH
+endif
+
 # Match the VFS allocation APIs exposed by the build headers.
 kasumi-public-alloc-inode := $(shell grep -E '^[[:space:]]*(extern[[:space:]]+)?struct[[:space:]]+inode[[:space:]]*\*[[:space:]]*alloc_inode\b' $(srctree)/include/linux/fs.h)
 ifneq ($(kasumi-public-alloc-inode),)

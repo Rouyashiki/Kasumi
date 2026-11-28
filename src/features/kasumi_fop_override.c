@@ -72,6 +72,21 @@ static bool kasumi_fop_override_stopped;
 
 KASUMI_NOCFI static int kasumi_shadow_iterate_shared(struct file *file,
 						 struct dir_context *ctx);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
+static int KASUMI_NOCFI kasumi_shadow_iterate(struct file *file,
+					      struct dir_context *ctx);
+#endif
+
+static bool kasumi_fop_is_shadow(const struct file_operations *ops)
+{
+	if (!ops)
+		return false;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
+	if (ops->iterate == kasumi_shadow_iterate)
+		return true;
+#endif
+	return ops->iterate_shared == kasumi_shadow_iterate_shared;
+}
 
 static struct kasumi_fop_meta *kasumi_fop_lookup_rcu(struct inode *inode)
 {
@@ -138,7 +153,7 @@ const struct file_operations *kasumi_fop_original_operations(const struct file *
 {
 	const struct file_operations *operations = READ_ONCE(file->f_op);
 
-	if (operations && operations->iterate_shared == kasumi_shadow_iterate_shared)
+	if (kasumi_fop_is_shadow(operations))
 		return kasumi_fop_original(file);
 	return operations;
 }
@@ -372,20 +387,6 @@ static int KASUMI_NOCFI kasumi_shadow_fadvise(struct file *file, loff_t offset, 
 }
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
-static int KASUMI_NOCFI kasumi_shadow_iterate(struct file *file, struct dir_context *ctx)
-{
-	const struct file_operations *original = kasumi_fop_original(file);
-	struct kasumi_dir_native_guard guard;
-	int result;
-
-	kasumi_dir_native_enter(file, &guard);
-	result = original->iterate(file, ctx);
-	kasumi_dir_native_leave(file, &guard);
-	return result;
-}
-#endif
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
 static ssize_t KASUMI_NOCFI kasumi_shadow_sendpage(struct file *file, struct page *page, int offset, size_t length, loff_t *position, int more)
 {
 	const struct file_operations *original = kasumi_fop_original(file);
@@ -604,7 +605,9 @@ kasumi_fop_template_alloc(const struct file_operations *orig)
 	template->orig_fop = orig;
 	template->shadow_fop = *orig;
 	template->shadow_fop.owner = THIS_MODULE;
-	template->shadow_fop.iterate_shared = kasumi_shadow_iterate_shared;
+	if (orig->iterate_shared)
+		template->shadow_fop.iterate_shared =
+		    kasumi_shadow_iterate_shared;
 	if (orig->read)
 		template->shadow_fop.read = kasumi_shadow_read;
 	if (orig->write)
@@ -696,13 +699,13 @@ kasumi_fop_installed_table(const struct kasumi_fop_meta *m)
 		&template->shadow_fop;
 }
 
-KASUMI_NOCFI static int kasumi_shadow_iterate_shared(struct file *file,
-						 struct dir_context *ctx)
+static int KASUMI_NOCFI kasumi_fop_iterate(struct file *file,
+					   struct dir_context *ctx, bool shared)
 {
 	struct kasumi_fop_template *template;
 	struct kasumi_fop_meta *m;
 	const struct file_operations *fop;
-	const struct file_operations *orig;
+	kasumi_dir_iterate_fn iterate;
 	kasumi_fop_iterate_client_fn client = NULL;
 	void *client_data = NULL;
 	int srcu_idx;
@@ -711,25 +714,28 @@ KASUMI_NOCFI static int kasumi_shadow_iterate_shared(struct file *file,
 	if (!file)
 		return -EINVAL;
 	fop = READ_ONCE(file->f_op);
-	if (!fop || fop->iterate_shared != kasumi_shadow_iterate_shared)
+	if (!kasumi_fop_is_shadow(fop))
 		return -ENOTDIR;
 	template = container_of(fop, struct kasumi_fop_template, shadow_fop);
-	orig = template->orig_fop;
-
-	if (!orig || !orig->iterate_shared)
+	iterate = template->orig_fop->iterate_shared;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
+	if (!shared)
+		iterate = template->orig_fop->iterate;
+#endif
+	if (!iterate)
 		return -ENOTDIR;
 
 	if (kasumi_vfs_internal_current()) {
 		struct kasumi_dir_native_guard guard;
 
 		kasumi_dir_native_enter(file, &guard);
-		ret = orig->iterate_shared(file, ctx);
+		ret = iterate(file, ctx);
 		file->f_pos = ctx->pos;
 		kasumi_dir_native_leave(file, &guard);
 		return ret;
 	}
 	if (kasumi_vnode_is_ours(file_inode(file)))
-		return orig->iterate_shared(file, ctx);
+		return iterate(file, ctx);
 
 	atomic64_inc(&kasumi_hook_stats.iterate_fop_entries);
 	srcu_idx = srcu_read_lock(&kasumi_fop_client_srcu);
@@ -742,17 +748,31 @@ KASUMI_NOCFI static int kasumi_shadow_iterate_shared(struct file *file,
 	}
 	rcu_read_unlock();
 	if (client && client_data) {
-		ret = client(file, ctx, orig, client_data);
+		ret = client(file, ctx, iterate, client_data);
 		goto out;
 	}
 
 	atomic64_inc(&kasumi_hook_stats.iterate_fop_wrapped);
-	ret = kasumi_dir_view_iterate(file, file, orig, ctx,
-				     kasumi_dirhijack_collect, NULL, NULL);
+	ret = kasumi_dir_view_iterate(file, file, iterate, ctx,
+				      kasumi_dirhijack_collect, NULL, NULL);
 out:
 	srcu_read_unlock(&kasumi_fop_client_srcu, srcu_idx);
 	return ret;
 }
+
+KASUMI_NOCFI static int kasumi_shadow_iterate_shared(struct file *file,
+						     struct dir_context *ctx)
+{
+	return kasumi_fop_iterate(file, ctx, true);
+}
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
+static int KASUMI_NOCFI kasumi_shadow_iterate(struct file *file,
+					      struct dir_context *ctx)
+{
+	return kasumi_fop_iterate(file, ctx, false);
+}
+#endif
 
 bool kasumi_fop_file_is_shadowed(const struct file *file)
 {
@@ -761,8 +781,7 @@ bool kasumi_fop_file_is_shadowed(const struct file *file)
 	if (!file)
 		return false;
 	fop = READ_ONCE(file->f_op);
-	return fop && fop->owner == THIS_MODULE &&
-	       fop->iterate_shared == kasumi_shadow_iterate_shared;
+	return fop && fop->owner == THIS_MODULE && kasumi_fop_is_shadow(fop);
 }
 
 static void kasumi_fop_add_owner(struct kasumi_fop_meta *m, bool inject)
@@ -802,7 +821,7 @@ KASUMI_NOCFI int kasumi_fop_get(struct inode *inode, bool inject)
 
 	orig = READ_ONCE(inode->i_fop);
 	spin_unlock(&kasumi_fop_lock);
-	if (!orig || !orig->iterate_shared)
+	if (!kasumi_dir_iterator(orig))
 		return -EOPNOTSUPP;
 	spare = kasumi_fop_template_alloc(orig);
 	if (IS_ERR(spare))

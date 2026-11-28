@@ -219,7 +219,7 @@ static struct dentry *kasumi_dh_lookup(struct inode *dir, struct dentry *dentry,
 static int kasumi_dh_atomic_open(struct inode *dir, struct dentry *dentry,
 				struct file *file, unsigned int flags, umode_t mode);
 static int kasumi_dh_iterate(struct file *file, struct dir_context *ctx,
-			     const struct file_operations *orig, void *data);
+			     kasumi_dir_iterate_fn iterate, void *data);
 static int kasumi_dh_prepare_dentry_ops(struct kasumi_dh_dir *dir,
 	struct dentry *dentry, u64 generation);
 static void kasumi_dh_retire_unhashed(struct dentry *dentry);
@@ -792,10 +792,10 @@ static struct dentry *kasumi_dh_lookup(struct inode *dir, struct dentry *dentry,
 }
 
 static int kasumi_dh_iterate(struct file *file, struct dir_context *ctx,
-			     const struct file_operations *original, void *data)
+			     kasumi_dir_iterate_fn iterate, void *data)
 {
-	return kasumi_dir_view_iterate(file, file, original, ctx,
-				      kasumi_dirhijack_collect, NULL, NULL);
+	return kasumi_dir_view_iterate(file, file, iterate, ctx,
+				       kasumi_dirhijack_collect, NULL, NULL);
 }
 
 /* ---- per-observer d_revalidate (SRCU-wrapped) -------------------------- */
@@ -1675,11 +1675,11 @@ int KASUMI_NOCFI kasumi_dh_reclaim_drop_inode(struct inode *inode,
 /* ---- install ----------------------------------------------------------- */
 
 /* Install (or, on a dir already carrying our lookup shadow, upgrade to add) the
- * iterate_shared shadow so readdir runs through kasumi_dh_iterate.  Only inject
+ * directory iterator so readdir runs through kasumi_dh_iterate.  Only inject
  * and hide children need it; lookup_only (merge) children leave readdir to the
- * overlay filldir, so their dir is installed iop-only and never gets this shadow
- * — lookup (i_op) and iterate (i_fop) are independent inode fields, so the two
- * layers never contend when dirhijack only owns lookup. */
+ * overlay filldir, so their dir is installed iop-only and never gets this
+ * shadow — lookup (i_op) and iterate (i_fop) are independent inode fields, so
+ * the two layers never contend when dirhijack only owns lookup. */
 static int kasumi_dh_install_iterate(struct inode *inode,
 				     struct kasumi_dh_dir *dir)
 {

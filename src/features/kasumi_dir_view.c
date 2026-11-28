@@ -29,6 +29,7 @@ struct kasumi_dir_state {
 	struct file *file;
 	struct dentry *name_parent;
 	struct task_struct *operator;
+	struct file *locked_source;
 	struct mutex lock;
 	struct list_head entries;
 	DECLARE_HASHTABLE(names, 6);
@@ -619,8 +620,8 @@ static int KASUMI_NOCFI kasumi_dir_emit_injected(
 
 /* Keep native iterate_dir permissions, locking, position and atime. Ordinary
  * ACCESS comes from the outer syscall and reaches the source via its relay. */
-static int KASUMI_NOCFI kasumi_dir_source_iterate(struct file *file,
-						 struct dir_context *ctx)
+static int KASUMI_NOCFI kasumi_dir_source_iterate(
+    struct kasumi_dir_state *state, struct file *file, struct dir_context *ctx)
 {
 	struct inode *inode = file_inode(file);
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
@@ -655,6 +656,10 @@ static int KASUMI_NOCFI kasumi_dir_source_iterate(struct file *file,
 		return ret;
 	ret = -ENOENT;
 	if (!IS_DEADDIR(inode)) {
+		struct file *outer_source = state->locked_source;
+
+		/* Reentry on this backing file already holds its inode lock. */
+		state->locked_source = file;
 		ctx->pos = file->f_pos;
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
 		if (!shared)
@@ -662,6 +667,7 @@ static int KASUMI_NOCFI kasumi_dir_source_iterate(struct file *file,
 		else
 #endif
 			ret = file->f_op->iterate_shared(file, ctx);
+		state->locked_source = outer_source;
 		file->f_pos = ctx->pos;
 		file_accessed(file);
 	}
@@ -674,11 +680,10 @@ static int KASUMI_NOCFI kasumi_dir_source_iterate(struct file *file,
 	return ret;
 }
 
-int KASUMI_NOCFI
-kasumi_dir_view_iterate(struct file *file, struct file *native,
-			const struct file_operations *operations,
-			struct dir_context *ctx, kasumi_dir_collect_fn collect,
-			void *data, const struct kasumi_dir_identity *identity)
+int KASUMI_NOCFI kasumi_dir_view_iterate(
+    struct file *file, struct file *native, kasumi_dir_iterate_fn iterate,
+    struct dir_context *ctx, kasumi_dir_collect_fn collect, void *data,
+    const struct kasumi_dir_identity *identity)
 {
 	struct kasumi_dir_state *state = kasumi_dir_state_get(file);
 	struct kasumi_dir_scope scope;
@@ -695,10 +700,18 @@ kasumi_dir_view_iterate(struct file *file, struct file *native,
 
 	if (!state)
 		return -ENOMEM;
-	if (READ_ONCE(state->operator) == current)
-		return native && operations && operations->iterate_shared
-			   ? operations->iterate_shared(native, ctx)
-			   : -EDEADLK;
+	if (READ_ONCE(state->operator) == current) {
+		struct kasumi_internal_vfs_guard guard;
+
+		if (!native || !iterate)
+			return -EDEADLK;
+		if (native == file || state->locked_source == native)
+			return iterate(native, ctx);
+		kasumi_vfs_internal_enter(&guard);
+		ret = kasumi_dir_source_iterate(state, native, ctx);
+		kasumi_vfs_internal_leave(&guard);
+		return ret;
+	}
 	mutex_lock(&state->lock);
 	WRITE_ONCE(state->operator, current);
 	starting = !state->prepared;
@@ -726,10 +739,11 @@ kasumi_dir_view_iterate(struct file *file, struct file *native,
 		proxy.stopped = false;
 		kasumi_vfs_internal_enter(&guard);
 		if (native == file) {
-			ret = operations->iterate_shared(native, &proxy.ctx);
+			ret = iterate(native, &proxy.ctx);
 			native->f_pos = proxy.ctx.pos;
 		} else {
-			ret = kasumi_dir_source_iterate(native, &proxy.ctx);
+			ret = kasumi_dir_source_iterate(state, native,
+							&proxy.ctx);
 		}
 		kasumi_vfs_internal_leave(&guard);
 		state->native_pos = proxy.ctx.pos;

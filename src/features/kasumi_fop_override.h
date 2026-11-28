@@ -10,11 +10,11 @@
 #ifndef _KASUMI_FOP_OVERRIDE_H
 #define _KASUMI_FOP_OVERRIDE_H
 
-#include <linux/fs.h>
+#include "kasumi_dir_view.h"
 
 typedef int (*kasumi_fop_iterate_client_fn)(struct file *file,
 					    struct dir_context *ctx,
-					    const struct file_operations *orig,
+					    kasumi_dir_iterate_fn iterate,
 					    void *data);
 
 int kasumi_fop_override_init(void);

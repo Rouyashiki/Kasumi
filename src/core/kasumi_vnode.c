@@ -649,6 +649,9 @@ static bool kasumi_vnode_exec_idmap_supported(const struct path *visible,
 static int KASUMI_NOCFI kasumi_vnode_open(struct inode *inode, struct file *file)
 {
 	struct kasumi_vnode_info *info = inode->i_private;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+	const struct path *user_path = &file->f_path;
+#endif
 	struct file *real_file;
 	int ret;
 
@@ -669,8 +672,14 @@ static int KASUMI_NOCFI kasumi_vnode_open(struct inode *inode, struct file *file
 	if (!kasumi_dentry_open)
 		return -EOPNOTSUPP;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
-	real_file = backing_file_open(&file->f_path, file->f_flags,
-				      &info->source, file->f_cred);
+#ifdef KASUMI_BACKING_FILE_HAS_REAL_PATH
+	/* This ABI passes the user path in f_path to the source ->open.
+	 * A stacked filesystem needs its own dentry there. */
+	if (info->source.dentry->d_sb->s_stack_depth)
+		user_path = &info->source;
+#endif
+	real_file = backing_file_open(user_path, file->f_flags, &info->source,
+				      file->f_cred);
 #else
 	real_file = kasumi_dentry_open(&info->source, file->f_flags,
 				       file->f_cred);
@@ -1824,9 +1833,12 @@ static int KASUMI_NOCFI kasumi_vnode_dir_iterate(struct file *file,
 	source = real_dir ? file_inode(real_dir) : NULL;
 	identity.source_identity = source != NULL;
 	identity.source_dev = source ? source->i_sb->s_dev : 0;
-	return kasumi_dir_view_iterate(file, real_dir,
-		real_dir ? kasumi_fop_original_operations(real_dir) : NULL, ctx,
-		kasumi_vnode_collect_children, NULL, &identity);
+	return kasumi_dir_view_iterate(
+	    file, real_dir,
+	    real_dir
+		? kasumi_dir_iterator(kasumi_fop_original_operations(real_dir))
+		: NULL,
+	    ctx, kasumi_vnode_collect_children, NULL, &identity);
 }
 
 struct kasumi_virtual_dop {

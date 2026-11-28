@@ -415,8 +415,13 @@ static int kasumi_transaction_commit(struct kasumi_transaction_state *state)
 	list_for_each_entry(rule, &state->rules, node) {
 		result = kasumi_apply_path_rule(rule->command, rule->visible,
 					       rule->source, rule->flags);
-		if (result)
+		if (result) {
+			pr_warn_ratelimited("kasumi: transaction %llu rule %u "
+					    "path=%s error=%d\n",
+					    state->status.id, index,
+					    rule->visible, result);
 			break;
+		}
 		index++;
 	}
 finish:
